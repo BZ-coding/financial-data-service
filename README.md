@@ -17,8 +17,10 @@
 | **日K历史** | akshare → tushare → tickflow 三级降级 |
 | **北向资金** | 沪深港通 Top10 持仓（Tushare） |
 | **财经新闻** | 全网聚合（HackerNews + GitHub Trending + 同花顺） |
+| **美股行情** | Massive API，实时 + 分钟K（Bearer Token 认证） |
 | **股吧舆情** | 东方财富股吧帖子采集 |
 | **公告数据** | 巨潮资讯个股公告 |
+| **RSS订阅** | 财经 RSS Feed 定时抓取 |
 | **智能调度** | 按订阅自动采集，支持交易时段限制 |
 | **REST API** | FastAPI + Swagger 文档，端口 8084 |
 
@@ -102,6 +104,9 @@ open http://localhost:8084/admin
 | `news` | 财经新闻 | akshare | `news_data` |
 | `community` | 股吧社区 | akshare | `community_data` |
 | `announcement` | 公告 | akshare | `announcement_data` |
+| 美股实时/分钟K | 美股行情 | massive | `price_data` |
+| RSS | 财经订阅源 | rss | `news_data` |
+| 全网聚合 | 多平台新闻 | news_aggregator | `news_aggregator_data` |
 
 ---
 
@@ -137,7 +142,7 @@ market_service/
 │   ├── akshare.py      # 股票/基金/指数/新闻（主力）
 │   ├── tushare.py      # 日K历史 / 北向资金
 │   ├── tickflow.py     # 日K历史（降级兜底）
-│   ├── massive.py       # 美股实时（降级）
+│   ├── massive.py      # 美股实时/分钟K
 │   ├── router.py       # 多源降级路由器
 │   ├── rss.py          # RSS 订阅
 │   └── news_aggregator.py  # 全网聚合新闻
