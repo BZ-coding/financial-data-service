@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ stats.title or 'Market Data Service Admin' }}</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .card { background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .stat { background: #f8f9fa; padding: 15px; border-radius: 6px; text-align: center; }
+        .stat-value { font-size: 24px; font-weight: bold; color: #007bff; }
+        .stat-label { font-size: 12px; color: #666; margin-top: 5px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; font-size: 14px; }
+        th { background: #f8f9fa; font-weight: 600; }
+        .error { color: #dc3545; }
+        .success { color: #28a745; }
+        .neutral { color: #6c757d; }
+        .timestamp { color: #999; font-size: 12px; }
+        h2 { margin-top: 0; color: #333; }
+        .refresh { float: right; }
+        a { color: #007bff; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>📊 Market Data Service Admin</h1>
+
+    <!-- 统计卡片 -->
+    <div class="card">
+        <div class="stat-grid">
+            <div class="stat">
+                <div class="stat-value">{{ stats.records.nav + stats.records.price + stats.records.news }}</div>
+                <div class="stat-label">总记录数</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{{ stats.records.nav }}</div>
+                <div class="stat-label">基金净值</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{{ stats.records.price }}</div>
+                <div class="stat-label">实时行情</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{{ stats.records.news }}</div>
+                <div class="stat-label">财经新闻</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{{ stats.active_subscriptions }}</div>
+                <div class="stat-label">活跃订阅</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{{ "%.1f"|format(stats.database_size_mb) }} MB</div>
+                <div class="stat-label">数据库大小</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{{ stats.success_rate_24h }}%</div>
+                <div class="stat-label">24h采集成功率</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{{ generated_at }}</div>
+                <div class="stat-label">生成时间</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 最近错误 -->
+    <div class="card">
+        <h2>⚠️ 最近采集错误 ({{ errors.count }})</h2>
+        {% if errors.errors %}
+        <table>
+            <thead>
+                <tr>
+                    <th>时间</th>
+                    <th>源</th>
+                    <th>Symbol</th>
+                    <th>类型</th>
+                    <th>错误信息</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for err in errors.errors %}
+                <tr class="error">
+                    <td class="timestamp">{{ err.started_at }}</td>
+                    <td>{{ err.source }}</td>
+                    <td>{{ err.symbol or '' }}</td>
+                    <td>{{ err.data_type }}</td>
+                    <td>{{ err.error_message }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p class="success">✅ 最近2小时无错误</p>
+        {% endif %}
+    </div>
+
+    <!-- 订阅列表 -->
+    <div class="card">
+        <h2>📋 订阅配置 (显示前{{ subscriptions|length }})</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>名称</th>
+                    <th>类型</th>
+                    <th>Symbol</th>
+                    <th>数据类型</th>
+                    <th>频率(min)</th>
+                    <th>交易时段限制</th>
+                    <th>备用源</th>
+                    <th>状态</th>
+                    <th>上次运行</th>
+                </tr>
+            </thead>
+            <tbody>{% for sub in subscriptions %}<tr>
+    <td>{{ sub.id }}</td>
+    <td>{{ sub.name }}</td>
+    <td>{{ sub.type }}</td>
+    <td>{{ sub.symbol or '-' }}</td>
+    <td>{{ sub.data_types|join(', ') }}</td>
+    <td>{{ sub.frequency_min }}</td>
+    <td>{{ '✅ 是' if sub.trading_hours_only else '❌ 否' }}</td>
+    <td>{{ sub.backup_sources or '-' }}</td>
+    <td class="{{ 'success' if sub.enabled else 'neutral' }}">{{ '启用' if sub.enabled else '禁用' }}</td>
+    <td class="timestamp">{{ sub.last_collected or '从未' }}</td>
+</tr>{% endfor %}</tbody>
+        </table>
+        <p style="margin-top: 10px;">
+            <a href="/api/v1/subscriptions" target="_blank">查看全部订阅 (API)</a>
+        </p>
+    </div>
+
+    <!-- 链接 -->
+    <div class="card">
+        <h2>🔗 快速链接</h2>
+        <ul>
+            <li><a href="/api/docs" target="_blank">API 文档 (Swagger)</a></li>
+            <li><a href="/api/v1/stats" target="_blank">统计 API (JSON)</a></li>
+            <li><a href="/api/v1/subscriptions" target="_blank">订阅列表 API</a></li>
+            <li><a href="/api/v1/errors" target="_blank">错误日志 API</a></li>
+        </ul>
+    </div>
+</div>
+<!-- 自动刷新 -->
+<script>
+    setTimeout(() => location.reload(), 300000); // 5分钟自动刷新
+</script>
+</body>
+</html>

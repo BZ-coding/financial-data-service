@@ -1,0 +1,65 @@
+# Market Data Service 配置
+# 版本: 1.0
+
+database:
+  path: "data/market.db"
+  wal_mode: true          # 启用WAL模式，提高并发
+  journal_mode: "WAL"
+  busy_timeout: 5000      # 忙等待5秒
+
+logging:
+  level: "INFO"           # DEBUG, INFO, WARNING, ERROR
+  directory: "logs"
+  max_files: 10
+  max_size_mb: 10
+
+api:
+  host: "127.0.0.1"
+  port: 8080
+  reload: false          # 生产环境关闭热重载
+  workers: 1             # SQLite不支持多进程并发写入
+
+scheduler:
+  check_interval_seconds: 60  # 每分钟检查一次订阅
+  batch_size: 20              # 每次最多采集多少个symbol（防爆）
+
+collectors:
+  akshare:
+    enabled: true
+    rate_limit_per_minute: 30
+    timeout_seconds: 30
+    retry_attempts: 3
+    retry_backoff_factor: 2
+
+  rss:
+    enabled: true
+    rate_limit_per_second: 1
+    timeout_seconds: 15
+
+  massive:
+    enabled: true
+    api_key: "6Hkk3xTJy7EMATDicfsis0G9EvnC5AiV"
+    rate_limit_per_minute: 30
+    timeout_seconds: 30
+
+  tushare:
+    enabled: true
+    token: "2abb9fd96ba5d57e79650ab02f25cdb4148c43b57611bc7e7a150c69"
+    rate_limit_per_minute: 30
+    timeout_seconds: 30
+
+  tickflow:
+    enabled: true
+    api_key: "tk_f8ca8eef098d44b7b7e870928446fd84"
+    rate_limit_per_minute: 30
+    timeout_seconds: 30
+
+retention:
+  news_days: 30
+  price_days: 60
+  announcement_days: 90
+  cleanup_hour: 2            # 每日凌晨2点清理
+
+admin:
+  enabled: true
+  page_title: "Market Data Service Admin"

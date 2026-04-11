@@ -1,0 +1,9 @@
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+pydantic==2.6.3
+akshare==1.18.51
+feedparser==6.0.12
+pandas==2.2.1
+numpy==1.26.4
+python-dateutil==2.9.0.post0
+pytz==2024.1
