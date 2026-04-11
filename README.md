@@ -79,6 +79,13 @@ curl http://localhost:8084/api/v1/stats | python3 -m json.tool
 
 访问 http://localhost:8084/api/docs 查看完整 API 文档。
 
+### Web 管理界面
+
+```bash
+# 管理界面（订阅管理、数据查看、错误日志）
+open http://localhost:8084/admin
+```
+
 ---
 
 ## 数据类型
