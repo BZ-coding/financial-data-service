@@ -60,7 +60,7 @@ class ChainCollector:
 
     # 每个 data_type 默认的链顺序（可被 source_metrics 动态调整）
     DEFAULT_CHAINS: Dict[str, List[str]] = {
-        "nav":          ["akshare", "tushare"],
+        "nav":          ["akshare"],         # tushare 不支持 nav，只用 akshare
         "estimate_nav": ["akshare"],          # 只有 fundgz 支持
         "price":        ["akshare", "sina", "tickflow", "massive"],
         "minute":       ["akshare", "tickflow"],

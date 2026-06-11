@@ -1,0 +1,53 @@
+admin:
+  enabled: true
+  page_title: Market Data Service Admin
+api:
+  host: 0.0.0.0
+  port: 8084
+  reload: false
+  workers: 1
+collectors:
+  akshare:
+    enabled: true
+    rate_limit_per_minute: 30
+    retry_attempts: 3
+    retry_backoff_factor: 2
+    timeout_seconds: 30
+  rss:
+    enabled: true
+    rate_limit_per_second: 1
+    timeout_seconds: 15
+
+  massive:
+    enabled: true
+    api_key: "6Hkk3xTJy7EMATDicfsis0G9EvnC5AiV"
+    rate_limit_per_minute: 30
+    timeout_seconds: 30
+  tickflow:
+    enabled: true
+    api_key: "tk_f8ca8eef098d44b7b7e870928446fd84"
+    rate_limit_per_minute: 30
+    timeout_seconds: 30
+  tushare:
+    enabled: true
+    token: "2abb9fd96ba5d57e79650ab02f25cdb4148c43b57611bc7e7a150c69"
+    rate_limit_per_minute: 60
+    timeout_seconds: 30
+database:
+  busy_timeout: 5000
+  journal_mode: WAL
+  path: /home/zsd/financial-data-service/market_service/data/market.db
+  wal_mode: true
+logging:
+  directory: logs
+  level: INFO
+  max_files: 10
+  max_size_mb: 10
+retention:
+  announcement_days: 90
+  cleanup_hour: 2
+  news_days: 30
+  price_days: 60
+scheduler:
+  batch_size: 20
+  check_interval_seconds: 60

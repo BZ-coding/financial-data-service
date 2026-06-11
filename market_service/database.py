@@ -1095,6 +1095,238 @@ class Database:
         logger.info(f"清理完成: {deleted_counts}")
         return deleted_counts
 
+    # ==================== FAILED TRANSFORMS（死信队列）====================
+
+    def get_unresolved_transforms(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """获取未解决的转换错误（死信队列）"""
+        try:
+            cur = self.conn.execute("""
+                SELECT id, data_type, symbol, source, raw_sample,
+                       transform_error, stack_trace, created_at
+                FROM failed_transforms
+                WHERE resolved_at IS NULL
+                ORDER BY created_at ASC
+                LIMIT ?
+            """, (limit,))
+            return [dict(row) for row in cur.fetchall()]
+        except Exception as e:
+            logger.error(f"get_unresolved_transforms 失败: {e}")
+            return []
+
+    def mark_transform_resolved(
+        self, letter_id: int, resolution: str = "manual", resolved_by: str = "scheduler"
+    ) -> bool:
+        """标记死信为已解决"""
+        try:
+            self.conn.execute("""
+                UPDATE failed_transforms
+                SET resolved_at = ?, resolution = ?, resolved_by = ?
+                WHERE id = ?
+            """, (now_tz().isoformat(), resolution, resolved_by, letter_id))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"mark_transform_resolved 失败: {e}")
+            return False
+
+    def insert_failed_transform(
+        self, data_type: str, symbol: Optional[str], source: str,
+        raw_sample: str, transform_error: str, stack_trace: str = ""
+    ) -> bool:
+        """插入死信（转换失败时由 chain 调用）"""
+        try:
+            self.conn.execute("""
+                INSERT INTO failed_transforms
+                (data_type, symbol, source, raw_sample, transform_error, stack_trace)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (data_type, symbol, source, raw_sample, transform_error, stack_trace))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"insert_failed_transform 失败: {e}")
+            return False
+
+    # ==================== FAILED COLLECTIONS（限频重试队列）====================
+
+    def insert_failed_collection(
+        self, subscription_id: int, source: str, symbol: Optional[str],
+        data_type: str, config: Optional[Dict[str, Any]] = None,
+        error_message: str = "", retry_after: Optional[datetime] = None
+    ) -> bool:
+        """插入限频记录（重试队列）"""
+        try:
+            self.conn.execute("""
+                INSERT INTO failed_collections
+                (subscription_id, source, symbol, data_type, config,
+                 error_message, retry_after)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                subscription_id, source, symbol, data_type,
+                json.dumps(config, ensure_ascii=False) if config else None,
+                error_message,
+                retry_after.isoformat() if retry_after else None,
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"insert_failed_collection 失败: {e}")
+            return False
+
+    def get_due_failed_collections(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+        """获取冷却到期的限频重试记录"""
+        if now is None:
+            now = now_tz()
+        try:
+            cur = self.conn.execute("""
+                SELECT id, subscription_id, source, symbol, data_type,
+                       config, error_message, retry_after, created_at
+                FROM failed_collections
+                WHERE retry_after IS NULL OR retry_after <= ?
+                ORDER BY created_at ASC
+            """, (now.isoformat(),))
+            return [dict(row) for row in cur.fetchall()]
+        except Exception as e:
+            logger.error(f"get_due_failed_collections 失败: {e}")
+            return []
+
+    def remove_failed_collection(self, fail_id: int) -> bool:
+        """删除限频重试记录（重试成功后调用）"""
+        try:
+            self.conn.execute("DELETE FROM failed_collections WHERE id = ?", (fail_id,))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"remove_failed_collection 失败: {e}")
+            return False
+
+    def update_failed_collection_retry_after(
+        self, fail_id: int, retry_after: datetime
+    ) -> bool:
+        """更新限频重试的冷却截止时间"""
+        try:
+            self.conn.execute("""
+                UPDATE failed_collections
+                SET retry_after = ?, updated_at = ?
+                WHERE id = ?
+            """, (retry_after.isoformat(), now_tz().isoformat(), fail_id))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"update_failed_collection_retry_after 失败: {e}")
+            return False
+
+    # ==================== SOURCE METRICS（信源质量动态排名）====================
+
+    def get_source_metrics(self, data_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """获取指定数据类型的信源质量（所有信源）"""
+        try:
+            if data_type:
+                cur = self.conn.execute("""
+                    SELECT source, data_type, total, success, failure,
+                           transform_error, avg_sec, success_rate,
+                           is_degraded, updated_at, consecutive_success
+                    FROM source_metrics
+                    WHERE data_type = ?
+                    ORDER BY success_rate DESC, total DESC
+                """, (data_type,))
+            else:
+                cur = self.conn.execute("""
+                    SELECT source, data_type, total, success, failure,
+                           transform_error, avg_sec, success_rate,
+                           is_degraded, updated_at, consecutive_success
+                    FROM source_metrics
+                    ORDER BY success_rate DESC, total DESC
+                """)
+            return [dict(row) for row in cur.fetchall()]
+        except Exception as e:
+            logger.error(f"get_source_metrics 失败: {e}")
+            return []
+
+    def get_source_metric(self, source: str, data_type: str) -> Optional[Dict[str, Any]]:
+        """获取单个 (source, data_type) 的信源质量"""
+        try:
+            cur = self.conn.execute("""
+                SELECT source, data_type, total, success, failure,
+                       transform_error, avg_sec, success_rate,
+                       is_degraded, updated_at, consecutive_success
+                FROM source_metrics
+                WHERE source = ? AND data_type = ?
+            """, (source, data_type))
+            row = cur.fetchone()
+            return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"get_source_metric 失败: {e}")
+            return None
+
+    def upsert_source_metric(
+        self, source: str, data_type: str,
+        success: bool, is_transform_error: bool = False, duration: float = 0.0
+    ) -> bool:
+        """
+        增量更新 source_metrics（成功/失败计数 + 移动平均耗时 + 成功率 + 连续成功）。
+        每次采集都调一次，用 UPSERT 保证原子。
+        """
+        try:
+            inc_total = 1
+            inc_success = 1 if success else 0
+            inc_failure = 0 if success else 1
+            inc_te = 1 if is_transform_error else 0
+
+            # 连续成功：成功时 +1，失败时清零
+            if success:
+                consec_expr = "COALESCE(consecutive_success, 0) + 1"
+            else:
+                consec_expr = "0"
+
+            self.conn.execute("""
+                INSERT INTO source_metrics
+                (source, data_type, total, success, failure, transform_error,
+                 avg_sec, success_rate, is_degraded, updated_at, consecutive_success)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                ON CONFLICT(source, data_type) DO UPDATE SET
+                    total = total + ?,
+                    success = success + ?,
+                    failure = failure + ?,
+                    transform_error = transform_error + ?,
+                    avg_sec = (avg_sec * total + ?) / (total + 1),
+                    success_rate = CAST(success + ? AS REAL) / (total + 1),
+                    updated_at = ?,
+                    consecutive_success = ?
+            """, (
+                source, data_type, inc_total, inc_success, inc_failure, inc_te,
+                duration,
+                1.0 if success else 0.0,   # 首次插入的 success_rate
+                now_tz().isoformat(),
+                1 if success else 0,
+                # ON CONFLICT 后的更新参数
+                inc_total, inc_success, inc_failure, inc_te,
+                duration,            # 移动平均的当前耗时
+                inc_success,         # 新增的成功数
+                now_tz().isoformat(),
+                consec_expr,         # SQL 表达式字符串 → 但参数化的是字面 0/1
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"upsert_source_metric 失败: {e}")
+            return False
+
+    def set_source_degraded(
+        self, source: str, data_type: str, is_degraded: bool
+    ) -> bool:
+        """设置/解除信源降级标志"""
+        try:
+            self.conn.execute("""
+                UPDATE source_metrics
+                SET is_degraded = ?, updated_at = ?
+                WHERE source = ? AND data_type = ?
+            """, (1 if is_degraded else 0, now_tz().isoformat(), source, data_type))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"set_source_degraded 失败: {e}")
+            return False
+
     def close(self):
         """关闭连接"""
         self.conn.close()

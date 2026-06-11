@@ -36,6 +36,15 @@ class MmxSearchCollector(BaseCollector):
 
     def _run_mmx(self, query: str) -> Optional[Dict[str, Any]]:
         """同步调用 mmx search，返回原始 JSON"""
+        # 启动时检测 mmx 命令是否可用，避免每次都 subprocess 抛 FileNotFoundError
+        if not getattr(self, "_mmx_available", None):
+            from shutil import which
+            self._mmx_available = which("mmx") is not None
+            if not self._mmx_available:
+                logger.warning("mmx CLI 未安装（which mmx 失败），mmx_search 采集器不可用")
+        if not self._mmx_available:
+            return None
+
         try:
             result = subprocess.run(
                 ["mmx", "search", "query", "--q", query, "--output", "json"],
@@ -86,6 +95,18 @@ class MmxSearchCollector(BaseCollector):
         start = time.time()
         query = kwargs.get("query")
         queries = [query] if query else self.default_queries
+
+        # mmx CLI 不可用时直接失败（避免 scheduler 把"空结果"当成功）
+        if not getattr(self, "_mmx_available", False):
+            return CollectResult(
+                success=False,
+                data=None,
+                source="mmx_search",
+                symbol="__search__",
+                data_type="mmx_search",
+                error="mmx CLI 未安装，mmx_search 采集器不可用",
+                duration_seconds=time.time() - start,
+            )
 
         all_results = []
         for q in queries:
