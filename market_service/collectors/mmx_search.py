@@ -33,16 +33,21 @@ class MmxSearchCollector(BaseCollector):
             "美股行情",
         ]
         self.max_results_per_query = max_results_per_query
+        # 启动时主动检测 mmx 可用性（系统 PATH 必须含 mmx；systemd --user 实例
+        # 默认不带 .npm-global/bin，所以 unit file 必须显式 Environment="PATH=..."）
+        from shutil import which
+        self._mmx_available = which("mmx") is not None
+        if not self._mmx_available:
+            logger.warning(
+                "mmx CLI 未在 PATH 中找到（尝试 which mmx 失败），"
+                "mmx_search 采集器不可用；如已安装请检查 systemd unit 的 Environment PATH"
+            )
 
     def _run_mmx(self, query: str) -> Optional[Dict[str, Any]]:
-        """同步调用 mmx search，返回原始 JSON"""
-        # 启动时检测 mmx 命令是否可用，避免每次都 subprocess 抛 FileNotFoundError
-        if not getattr(self, "_mmx_available", None):
-            from shutil import which
-            self._mmx_available = which("mmx") is not None
-            if not self._mmx_available:
-                logger.warning("mmx CLI 未安装（which mmx 失败），mmx_search 采集器不可用")
-        if not self._mmx_available:
+        """同步调用 mmx search，返回原始 JSON。
+        _mmx_available 由 __init__ 设置，这里直接信任。
+        """
+        if not getattr(self, "_mmx_available", False):
             return None
 
         try:

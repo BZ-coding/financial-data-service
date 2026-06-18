@@ -530,6 +530,49 @@ class AKShareFetcher(BaseCollector):
         normalized['data_type'] = 'fundamental'
         return normalized
 
+    def _fetch_hk_quote_tencent(self, code: str) -> Optional[Dict[str, Any]]:
+        """从腾讯获取港股行情（字段索引与A股不同）"""
+        url = f"https://qt.gtimg.cn/q={code}"
+        try:
+            raw = self._get_with_backoff(url, headers={"Referer": "https://gu.qq.com/"})
+            import requests as _req
+        except Exception as e:
+            self.logger.warning(f"_fetch_hk_quote_tencent({code}) 失败: {e}")
+            return None
+        if "~" not in raw:
+            return None
+        parts = raw.split("~")
+        # 港股tencent格式有约78个字段（2026-06-18实测）
+        if len(parts) < 35:
+            self.logger.warning(f"_fetch_hk_quote_tencent({code}) 字段不足: {len(parts)}")
+            return None
+        try:
+            price = float(parts[3]) if parts[3] else 0.0
+            prev_close = float(parts[4]) if parts[4] else 0.0
+            open_ = float(parts[5]) if parts[5] else 0.0
+            high = float(parts[33]) if parts[33] else 0.0
+            low = float(parts[34]) if parts[34] else 0.0
+            volume = float(parts[36]) if len(parts) > 36 and parts[36] else 0.0
+            amount = float(parts[37]) if len(parts) > 37 and parts[37] else 0.0
+            trade_time = parts[30] if len(parts) > 30 else ""
+            name = parts[1] if len(parts) > 1 else ""
+        except Exception as e:
+            self.logger.warning(f"_fetch_hk_quote_tencent({code}) 字段解析失败: {e}")
+            return None
+        self.logger.info(f"_fetch_hk_quote_tencent({code}) 成功: price={price}, high={high}, low={low}")
+        return {
+            'source': 'tencent_hk',
+            'price': price,
+            'volume': volume,
+            'amount': amount,
+            'open': open_,
+            'high': high,
+            'low': low,
+            'prev_close': prev_close,
+            'name': name,
+            'trade_time': trade_time,
+        }
+
     def _fetch_stock_quote_sync(self, code: str, data_type: str = 'price', backup_sources: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
         now = now_tz()
         is_trading_hours = (
@@ -549,6 +592,26 @@ class AKShareFetcher(BaseCollector):
             pass
         else:
             self.logger.warning(f"未知data_type: {data_type}")
+            return None
+
+        # HK股票：直接走腾讯港股接口（不同字段索引）
+        if code.startswith('hk'):
+            result = self._fetch_hk_quote_tencent(code)
+            if result:
+                self.logger.info(f"_fetch_stock_quote_sync({code}) [tencent_hk] 港股成功")
+                return result
+            self.logger.warning(f"_fetch_stock_quote_sync({code}) [tencent_hk] 港股失败，尝试其他源")
+            # 港股不走A股spot/hist，直接试backup_sources（默认先sina）
+            backup_sources = backup_sources or ['sina']
+            for source in backup_sources:
+                if source == 'sina':
+                    try:
+                        result = self._fetch_stock_quote_sina(code)
+                        if result:
+                            self.logger.info(f"_fetch_stock_quote_sync({code}) [sina] 港股降级成功")
+                            return result
+                    except Exception as e:
+                        self.logger.error(f"_fetch_stock_quote_sync({code}) [sina] 港股降级失败: {e}")
             return None
         
         try:
