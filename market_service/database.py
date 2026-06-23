@@ -283,6 +283,28 @@ class Database:
             logger.error(f"插入聚合新闻失败: {e}")
             return False
 
+    def insert_mmx_search(self, data: Dict[str, Any]) -> bool:
+        """插入 mmx 搜索结果（mmx_search 采集器）"""
+        try:
+            self.conn.execute("""
+                INSERT OR IGNORE INTO mmx_search_data (
+                    query, title, link, snippet, date,
+                    collected_at, ingested_at
+                ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (
+                data['query'],
+                data.get('title', ''),
+                data.get('link', ''),
+                data.get('snippet', ''),
+                data.get('date', ''),
+                data.get('collected_at', '') or datetime.now(TZ).isoformat(),
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"insert_mmx_search失败: {e}")
+            return False
+
     def get_latest_news_aggregator(self) -> Optional[Dict[str, Any]]:
         """获取最新聚合新闻"""
         cur = self.conn.execute("""

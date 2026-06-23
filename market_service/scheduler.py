@@ -183,6 +183,17 @@ class Scheduler:
                 elif data_type in ('main_fund_rank', 'sector_fund_flow'):
                     self.db.insert_fund_flow(item)
                     stored += 1
+                elif data_type == 'mmx_search':
+                    # mmx_search 返回 {"items": [...], "collected_at": ..., "query_count": N}
+                    # items 元素: {query, title, link, snippet, date}
+                    mmx_items = item.get('items', []) if isinstance(item, dict) else []
+                    mmx_collected_at = item.get('collected_at', '') if isinstance(item, dict) else ''
+                    for mmx_item in mmx_items:
+                        # 把 collected_at 注入到 item
+                        if mmx_collected_at and 'collected_at' not in mmx_item:
+                            mmx_item['collected_at'] = mmx_collected_at
+                        if self.db.insert_mmx_search(mmx_item):
+                            stored += 1
                 elif data_type in ('zhihu_search', 'zhihu_global_search'):
                     # 知乎搜索/全网搜索 — 入 news_data 表
                     src = 'zhihu_search' if data_type == 'zhihu_search' else 'zhihu_global'
