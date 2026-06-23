@@ -177,7 +177,7 @@ class CommunityEnhancedCollector(BaseCollector):
             df = ak.stock_hot_deal_xq()
             if df.empty:
                 return []
-            
+
             items = []
             for _, row in df.iterrows():
                 items.append({
@@ -187,12 +187,118 @@ class CommunityEnhancedCollector(BaseCollector):
                     "price": float(row.get("最新价", 0)),
                     "source": "xueqiu_hot_deal",
                 })
-            
+
             self.logger.info(f"_fetch_xueqiu_hot_deal 获取 {len(items)} 条热交易")
             return items
-            
+
         except Exception as e:
             self.logger.warning(f"_fetch_xueqiu_hot_deal 异常: {e}")
+            return None
+
+    # ========== 主力资金榜 / 板块资金流 (mcp-eastmoney 同源 API) ==========
+
+    def _get_with_backoff(self, url: str, headers=None, timeout=10, max_retries=3):
+        """GET 请求 + 指数退避重试 (针对 EM push2 IP 封禁)"""
+        import time as _time
+        last_err = None
+        for attempt in range(max_retries):
+            try:
+                resp = self.session.get(url, headers=headers or {}, timeout=timeout)
+                if resp.status_code == 200:
+                    return resp
+                last_err = f"HTTP {resp.status_code}"
+            except Exception as e:
+                last_err = str(e)
+            wait = min(2 ** attempt, 8)
+            self.logger.warning(f"GET 失败 (attempt {attempt+1}/{max_retries}), {wait}s 后重试: {last_err}")
+            _time.sleep(wait)
+        raise Exception(f"重试 {max_retries} 次仍失败: {last_err}")
+
+    def _fetch_main_fund_rank(self, top_n: int = 20) -> Optional[List[Dict[str, Any]]]:
+        """
+        主力资金净流入 Top N (东方财富 push2delay 接口, mcp-eastmoney 同源)
+        fields: f12=code, f14=name, f2=price, f3=change_pct×100,
+                f62=main_net_inflow(元), f184=main_net_pct×100,
+                f66=super_large, f70=large, f76=medium, f78=small
+        """
+        try:
+            import time as _time
+            fs = "m:0+t:6,m:0+t:13,m:0+t:80,m:1+t:2,m:1+t:23,m:1+t:8"
+            ts = int(_time.time() * 1000)
+            # 用 push2delay (mcp-eastmoney 同款), push2 经常被封
+            url = (
+                f"https://push2delay.eastmoney.com/api/qt/clist/get"
+                f"?pn=1&pz={top_n}&po=1&np=1&fltt=2&invt=2"
+                f"&fid=f62&fs={fs}"
+                f"&fields=f12,f14,f2,f3,f62,f184,f66,f70,f76,f78"
+                f"&req_trace={ts}&_={ts}"
+            )
+            resp = self._get_with_backoff(url, headers={"Referer": "https://quote.eastmoney.com/"})
+            data = resp.json()
+            diff = (data.get("data") or {}).get("diff") or []
+            items = []
+            for i, r in enumerate(diff, start=1):
+                # f2=价格(元), f3=涨跌幅×100(%), f62=主力净流入(元), f184=主力净流入占比×100(%)
+                # f66/f70/f76/f78=超大/大/中/小单净额(元)
+                price_raw = r.get("f2")
+                price = float(price_raw) if isinstance(price_raw, (int, float)) else None
+                items.append({
+                    "rank_no": i,
+                    "symbol": r.get("f12"),
+                    "name": r.get("f14"),
+                    "price": price,
+                    "change_pct": (r.get("f3") or 0) / 100 if isinstance(r.get("f3"), (int, float)) else None,
+                    "main_net_inflow": r.get("f62"),
+                    "main_net_pct": (r.get("f184") or 0) / 100 if isinstance(r.get("f184"), (int, float)) else None,
+                    "super_large_net": r.get("f66"),
+                    "large_net": r.get("f70"),
+                    "medium_net": r.get("f76"),
+                    "small_net": r.get("f78"),
+                })
+            self.logger.info(f"_fetch_main_fund_rank 获取 {len(items)} 条")
+            return items
+        except Exception as e:
+            self.logger.warning(f"_fetch_main_fund_rank 异常: {e}")
+            return None
+
+    def _fetch_sector_fund_flow(self, kind: str = "industry", top_n: int = 15) -> Optional[List[Dict[str, Any]]]:
+        """
+        板块资金流 (industry/concept)
+        fields: f12=code, f14=name, f3=change_pct×100,
+                f62=main_net_inflow(元), f184=main_net_pct×100,
+                f128=leading_stock, f136=leading_change_pct×100
+        """
+        try:
+            import time as _time
+            fs = "m:90+t:2" if kind == "industry" else "m:90+t:3"
+            ts = int(_time.time() * 1000)
+            url = (
+                f"https://push2delay.eastmoney.com/api/qt/clist/get"
+                f"?pn=1&pz={top_n}&po=1&np=1&fltt=2&invt=2"
+                f"&fid=f62&fs={fs}"
+                f"&fields=f12,f14,f2,f3,f62,f184,f128,f136"
+                f"&req_trace={ts}&_={ts}"
+            )
+            resp = self._get_with_backoff(url, headers={"Referer": "https://quote.eastmoney.com/"})
+            data = resp.json()
+            diff = (data.get("data") or {}).get("diff") or []
+            items = []
+            for i, r in enumerate(diff, start=1):
+                items.append({
+                    "rank_no": i,
+                    "sector_kind": kind,
+                    "symbol": r.get("f12"),
+                    "name": r.get("f14"),
+                    "change_pct": (r.get("f3") or 0) / 100 if isinstance(r.get("f3"), (int, float)) else None,
+                    "main_net_inflow": r.get("f62"),
+                    "main_net_pct": (r.get("f184") or 0) / 100 if isinstance(r.get("f184"), (int, float)) else None,
+                    "leading_stock": r.get("f128") or "-",
+                    "leading_change_pct": (r.get("f136") or 0) / 100 if isinstance(r.get("f136"), (int, float)) else None,
+                })
+            self.logger.info(f"_fetch_sector_fund_flow({kind}) 获取 {len(items)} 条")
+            return items
+        except Exception as e:
+            self.logger.warning(f"_fetch_sector_fund_flow({kind}) 异常: {e}")
             return None
 
     # ========== collect 接口 ==========
@@ -203,8 +309,12 @@ class CommunityEnhancedCollector(BaseCollector):
         data_type:
           - "stock_news": 个股新闻（东方财富搜索API）
           - "xueqiu_hot": 雪球热帖+热关注+热交易
+          - "main_fund_rank": 主力资金净流入 Top 20
+          - "sector_fund_flow": 板块资金流 (industry/concept)
         """
         start = now_tz()
+        from datetime import datetime as _dt
+        rank_date = _dt.now(TZ).date().isoformat()
         
         if data_type == "stock_news":
             news_list = self._fetch_em_stock_news(symbol)
@@ -241,6 +351,51 @@ class CommunityEnhancedCollector(BaseCollector):
             return CollectResult(
                 success=True, data=all_items, source="xueqiu",
                 symbol="__all__", data_type=data_type,
+                duration_seconds=(now_tz() - start).total_seconds()
+            )
+
+        elif data_type == "main_fund_rank":
+            top_n = kwargs.get("top_n", 20)
+            items = self._fetch_main_fund_rank(top_n=top_n)
+            if items is None:
+                return CollectResult(
+                    success=False, data=None, source="eastmoney_em",
+                    symbol="__main_fund__", data_type=data_type,
+                    error="主力资金榜请求失败", duration_seconds=(now_tz() - start).total_seconds()
+                )
+            # 给每条加 flow_type 和 rank_date
+            for it in items:
+                it["flow_type"] = "main_fund_rank"
+                it["rank_date"] = rank_date
+                it["source"] = "eastmoney_em"
+                # raw 备份去掉自己引用, 避免 json.dumps 报 Circular reference
+                raw_copy = {k: v for k, v in it.items() if k != "raw"}
+                it["raw"] = raw_copy
+            return CollectResult(
+                success=True, data=items, source="eastmoney_em",
+                symbol="__main_fund__", data_type=data_type,
+                duration_seconds=(now_tz() - start).total_seconds()
+            )
+
+        elif data_type == "sector_fund_flow":
+            kind = kwargs.get("kind", "industry")
+            top_n = kwargs.get("top_n", 15)
+            items = self._fetch_sector_fund_flow(kind=kind, top_n=top_n)
+            if items is None:
+                return CollectResult(
+                    success=False, data=None, source="eastmoney_em",
+                    symbol=f"__sector_{kind}__", data_type=data_type,
+                    error=f"板块资金流({kind})请求失败", duration_seconds=(now_tz() - start).total_seconds()
+                )
+            for it in items:
+                it["flow_type"] = "sector_fund_flow"
+                it["rank_date"] = rank_date
+                it["source"] = "eastmoney_em"
+                raw_copy = {k: v for k, v in it.items() if k != "raw"}
+                it["raw"] = raw_copy
+            return CollectResult(
+                success=True, data=items, source="eastmoney_em",
+                symbol=f"__sector_{kind}__", data_type=data_type,
                 duration_seconds=(now_tz() - start).total_seconds()
             )
 

@@ -1,6 +1,6 @@
 -- Market Data Service - SQLite Schema
--- 版本: 1.0
--- 日期: 2026-04-06
+-- 版本: 1.1
+-- 日期: 2026-06-23 (新增 fund_flow_data 表)
 
 -- 注意：SQLite使用TEXT存储ISO8601时间字符串（带时区）
 -- Python端通过适配器自动转换datetime对象
@@ -283,3 +283,32 @@ CREATE TABLE IF NOT EXISTS news_aggregator_data (
     UNIQUE(collected_at)
 );
 CREATE INDEX IF NOT EXISTS idx_news_agg_cleanup ON news_aggregator_data(ingested_at);
+
+-- ============================================
+-- 主力资金/板块资金流表 (mcp-eastmoney 主力资金榜, 永久保存)
+-- ============================================
+CREATE TABLE IF NOT EXISTS fund_flow_data (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL DEFAULT 'eastmoney_em',  -- mcp-eastmoney / em_api
+    flow_type TEXT NOT NULL,                     -- main_fund_rank / sector_fund_flow
+    sector_kind TEXT,                            -- industry / concept (板块资金流)
+    rank_no INTEGER,                             -- 排名
+    symbol TEXT,                                 -- 个股代码 (主力资金流填)
+    name TEXT NOT NULL,                          -- 名称 (个股/板块)
+    price REAL,                                  -- 现价
+    change_pct REAL,                             -- 涨跌幅 (%)
+    main_net_inflow REAL,                        -- 主力净流入 (元)
+    main_net_pct REAL,                           -- 主力净流入占比 (%)
+    super_large_net REAL,                        -- 超大单净额
+    large_net REAL,                              -- 大单净额
+    medium_net REAL,                             -- 中单净额
+    small_net REAL,                              -- 小单净额
+    leading_stock TEXT,                          -- 领涨股 (板块资金流填)
+    leading_change_pct REAL,                     -- 领涨股涨跌幅 (%)
+    rank_data TEXT NOT NULL,                     -- 排序日期 YYYY-MM-DD
+    collected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    raw_data TEXT,
+    UNIQUE(source, flow_type, rank_data, name)
+);
+CREATE INDEX IF NOT EXISTS idx_fund_flow_lookup ON fund_flow_data(flow_type, rank_data DESC, rank_no);
+CREATE INDEX IF NOT EXISTS idx_fund_flow_cleanup ON fund_flow_data(collected_at);

@@ -749,6 +749,67 @@ class Database:
             logger.error(f"insert_community失败: {e}")
             return False
 
+    def insert_fund_flow(self, data: Dict[str, Any]) -> bool:
+        """插入主力资金/板块资金流数据"""
+        try:
+            # 解析 "12.34亿" 格式的字符串为浮点 (单位元)
+            def parse_amount(s):
+                if s is None: return None
+                if isinstance(s, (int, float)): return float(s)
+                s = str(s).strip()
+                if not s: return None
+                try:
+                    if '亿' in s: return float(s.replace('亿','')) * 1e8
+                    if '万' in s: return float(s.replace('万','')) * 1e4
+                    return float(s)
+                except: return None
+
+            self.conn.execute("""
+                INSERT OR IGNORE INTO fund_flow_data (
+                    source, flow_type, sector_kind, rank_no,
+                    symbol, name, price, change_pct,
+                    main_net_inflow, main_net_pct,
+                    super_large_net, large_net, medium_net, small_net,
+                    leading_stock, leading_change_pct,
+                    rank_data, raw_data
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                data.get('source', 'eastmoney_em'),
+                data['flow_type'],
+                data.get('sector_kind'),
+                data.get('rank_no'),
+                data.get('symbol'),
+                data['name'],
+                data.get('price'),
+                data.get('change_pct'),
+                parse_amount(data.get('main_net_inflow')),
+                data.get('main_net_pct'),
+                parse_amount(data.get('super_large_net')),
+                parse_amount(data.get('large_net')),
+                parse_amount(data.get('medium_net')),
+                parse_amount(data.get('small_net')),
+                data.get('leading_stock'),
+                data.get('leading_change_pct'),
+                data['rank_date'],
+                json.dumps(data.get('raw', {}), ensure_ascii=False) if data.get('raw') else None
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"insert_fund_flow失败: {e}")
+            return False
+
+    def get_fund_flow(self, flow_type: str, days: int = 7, limit: int = 50) -> List[Dict[str, Any]]:
+        """获取最近的主力资金/板块资金流数据"""
+        start_date = (datetime.now(TZ) - timedelta(days=days)).date().isoformat()
+        cur = self.conn.execute("""
+            SELECT * FROM fund_flow_data
+            WHERE flow_type = ? AND rank_data >= ?
+            ORDER BY rank_data DESC, rank_no ASC
+            LIMIT ?
+        """, (flow_type, start_date, limit))
+        return [dict(row) for row in cur.fetchall()]
+
     def get_community_posts(self, symbol: str, days: int = 30) -> List[Dict[str, Any]]:
         """获取最近社区帖子"""
         start_date = (datetime.now(TZ) - timedelta(days=days)).date()

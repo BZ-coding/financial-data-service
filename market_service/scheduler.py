@@ -22,6 +22,7 @@ from .collectors.mmx_search import MmxSearchCollector
 from .collectors.sina import SinaCollector
 from .collectors.eastmoney import EastMoneyCollector
 from .collectors.community_enhanced import CommunityEnhancedCollector
+from .collectors.zhihu import ZhihuCollector
 from .collectors.router import CollectorRouter
 from .collectors.chain import ChainCollector
 from .collectors.base import CollectResult
@@ -71,6 +72,16 @@ class Scheduler:
             ),
             'community_enhanced': CommunityEnhancedCollector(
                 rate_limit_per_minute=self.config['collectors'].get('community_enhanced', {}).get('rate_limit_per_minute', 20)
+            ),
+            'zhihu': ZhihuCollector(
+                rate_limit_per_minute=self.config['collectors'].get('zhihu', {}).get('rate_limit_per_minute', 30),
+                default_search_queries=self.config['collectors'].get('zhihu', {}).get('default_search_queries', [
+                    "易方达蓝筹精选", "中欧医疗健康", "金风科技 002202",
+                    "半导体 国产替代 2026", "美联储 降息"
+                ]),
+                default_global_queries=self.config['collectors'].get('zhihu', {}).get('default_global_queries', [
+                    "A股 今日行情", "新基金发行 2026", "新能源 政策"
+                ]),
             ),
             'eastmoney': EastMoneyCollector(
                 rate_limit_per_minute=self.config['collectors'].get('eastmoney', {}).get('rate_limit_per_minute', 30)
@@ -168,6 +179,49 @@ class Scheduler:
                         'link': f"https://xueqiu.com/S/{item.get('symbol', '')}",
                     }
                     self.db.insert_community(community_item)
+                    stored += 1
+                elif data_type in ('main_fund_rank', 'sector_fund_flow'):
+                    self.db.insert_fund_flow(item)
+                    stored += 1
+                elif data_type in ('zhihu_search', 'zhihu_global_search'):
+                    # 知乎搜索/全网搜索 — 入 news_data 表
+                    src = 'zhihu_search' if data_type == 'zhihu_search' else 'zhihu_global'
+                    news_item = {
+                        'source': src,
+                        'title': item.get('title', ''),
+                        'summary': (item.get('content', '') or '')[:500],
+                        'link': item.get('url', ''),
+                        'symbol': item.get('query', ''),
+                        'published': item.get('edit_time', ''),
+                    }
+                    self.db.insert_news(news_item)
+                    stored += 1
+                elif data_type == 'zhihu_hot_list':
+                    # 知乎热榜 — 入 community_data 表
+                    rank = item.get('rank', 0)
+                    community_item = {
+                        'source': 'zhihu_hot',
+                        'symbol': 'zhihu_hot',
+                        'title': f"[#{rank}] {item.get('title', '')}",
+                        'author': 'zhihu_hot',
+                        'reply_count': 0,
+                        'click_count': 0,
+                        'published': now_tz().strftime('%Y-%m-%d'),
+                        'link': item.get('url', ''),
+                    }
+                    self.db.insert_community(community_item)
+                    stored += 1
+                elif data_type == 'zhihu_zhida':
+                    # 知乎直答 — 入 news_data 表（question 当 title，answer 当 summary）
+                    news_item = {
+                        'source': 'zhihu_zhida',
+                        'title': '[知乎直答] ' + (item.get('question', '') or '')[:100],
+                        'summary': (item.get('answer', '') or '')[:2000],
+                        'link': '',
+                        'symbol': item.get('model', 'zhida-fast-1p5'),
+                        'published': now_tz().strftime('%Y-%m-%d %H:%M:%S'),
+                    }
+                    self.db.insert_news(news_item)
                     stored += 1
                 else:
                     logger.debug(f"未知数据类型: {data_type}, 跳过入库")
