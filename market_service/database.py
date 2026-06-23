@@ -17,10 +17,15 @@ logger = logging.getLogger(__name__)
 TZ = timezone(timedelta(hours=8))
 
 def adapt_datetime(ts: datetime) -> str:
-    """SQLite适配器：datetime -> ISO8601"""
+    """SQLite适配器：datetime -> 'YYYY-MM-DD HH:MM:SS'
+
+    用 SQLite 期望的格式 (空格分隔, 无 timezone 后缀), 否则 SQLite 的 datetime()
+    静默解析失败 (丢掉 T 和 timezone, 倒退 7 小时), 导致 get_due_subscriptions
+    比较出错, 订阅每 60s tick 都被认成 due (frequency_min 失效).
+    """
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=TZ)
-    return ts.isoformat()
+    return ts.strftime('%Y-%m-%d %H:%M:%S')
 
 def convert_datetime(s: bytes) -> datetime:
     """SQLite转换器：ISO8601 -> datetime"""
@@ -935,10 +940,20 @@ class Database:
 
 
     def update_subscription_last_run(self, sub_id: int, run_time: datetime):
-        """更新订阅上次运行时间"""
+        """更新订阅上次运行时间
+
+        SQLite 的 datetime() 函数不认 ISO 8601 (T 分隔) 和 timezone (+08:00),
+        会静默解析成错误时间 (倒退 7 小时), 导致 get_due_subscriptions 永远 due,
+        订阅被每 60s tick 触发 (实际应该按 frequency_min 等距).
+        修复: 写入前转成 SQLite 期望的 "YYYY-MM-DD HH:MM:SS" 格式.
+        """
+        # 兼容 datetime 对象 / 字符串
+        if isinstance(run_time, str):
+            run_time = datetime.fromisoformat(run_time)
+        sqlite_fmt = run_time.strftime('%Y-%m-%d %H:%M:%S')
         self.conn.execute("""
             UPDATE subscriptions SET last_collected = ? WHERE id = ?
-        """, (run_time, sub_id))
+        """, (sqlite_fmt, sub_id))
         self.conn.commit()
 
     def add_subscription(self, name: str, type_: str, config: Dict[str, Any],
