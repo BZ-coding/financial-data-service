@@ -33,6 +33,20 @@ collectors:
     token: "2abb9fd96ba5d57e79650ab02f25cdb4148c43b57611bc7e7a150c69"
     rate_limit_per_minute: 60
     timeout_seconds: 30
+  zhihu:
+    enabled: true
+    rate_limit_per_minute: 30
+    timeout_seconds: 30
+    default_search_queries:
+      - 易方达蓝筹精选
+      - 中欧医疗健康
+      - 金风科技 002202
+      - 半导体 国产替代 2026
+      - 美联储 降息
+    default_global_queries:
+      - A股 今日行情
+      - 新基金发行 2026
+      - 新能源 政策
 database:
   busy_timeout: 5000
   journal_mode: WAL
