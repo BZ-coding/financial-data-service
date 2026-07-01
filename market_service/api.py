@@ -119,7 +119,7 @@ async def get_data(
                     raise HTTPException(404, "未找到股票基本信息")
                 return row
             elif data_type == "index":
-                rows = db.get_latest_index()
+                rows = db.get_latest_index(symbol if symbol and symbol != "*" else None)
                 if not rows:
                     raise HTTPException(404, "未找到指数数据")
                 return rows
