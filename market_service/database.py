@@ -861,15 +861,26 @@ class Database:
             logger.error(f"insert_fund_flow失败: {e}")
             return False
 
-    def get_fund_flow(self, flow_type: str, days: int = 7, limit: int = 50) -> List[Dict[str, Any]]:
-        """获取最近的主力资金/板块资金流数据"""
+    def get_fund_flow(self, flow_type: str, days: int = 7, limit: int = 50, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        """获取最近的主力资金/板块资金流数据
+
+        symbol: 可选; 提供时按 sym 过滤 (单股资金流)
+        """
         start_date = (datetime.now(TZ) - timedelta(days=days)).date().isoformat()
-        cur = self.conn.execute("""
-            SELECT * FROM fund_flow_data
-            WHERE flow_type = ? AND rank_data >= ?
-            ORDER BY rank_data DESC, rank_no ASC
-            LIMIT ?
-        """, (flow_type, start_date, limit))
+        if symbol:
+            cur = self.conn.execute("""
+                SELECT * FROM fund_flow_data
+                WHERE flow_type = ? AND symbol = ? AND rank_data >= ?
+                ORDER BY rank_data DESC, rank_no ASC
+                LIMIT ?
+            """, (flow_type, symbol, start_date, limit))
+        else:
+            cur = self.conn.execute("""
+                SELECT * FROM fund_flow_data
+                WHERE flow_type = ? AND rank_data >= ?
+                ORDER BY rank_data DESC, rank_no ASC
+                LIMIT ?
+            """, (flow_type, start_date, limit))
         return [dict(row) for row in cur.fetchall()]
 
     def get_community_posts(self, symbol: str, days: int = 30) -> List[Dict[str, Any]]:

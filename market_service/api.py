@@ -154,12 +154,13 @@ async def get_data(
                 sector_kind = request.query_params.get("sector_kind")
                 days = int(request.query_params.get("days", 1))
                 limit = int(request.query_params.get("limit", 50))
-                rows = db.get_fund_flow(flow_type=flow_type, days=days, limit=limit)
+                symbol_param = symbol if symbol and symbol != "*" else None
+                rows = db.get_fund_flow(flow_type=flow_type, days=days, limit=limit, symbol=symbol_param)
                 if sector_kind:
                     rows = [r for r in rows if r.get("sector_kind") == sector_kind]
                 if not rows:
-                    raise HTTPException(404, f"未找到 {flow_type} 数据")
-                return {"flow_type": flow_type, "sector_kind": sector_kind, "items": rows, "count": len(rows)}
+                    raise HTTPException(404, f"未找到 {flow_type} 数据" + (f" (symbol={symbol_param})" if symbol_param else ""))
+                return {"flow_type": flow_type, "sector_kind": sector_kind, "symbol": symbol_param, "items": rows, "count": len(rows)}
             elif data_type == "fundamental":
                 row = db.get_latest_fundamental(symbol)
                 if not row:
