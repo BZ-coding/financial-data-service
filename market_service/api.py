@@ -63,6 +63,7 @@ if static_dir.exists():
 
 @app.get("/api/v1/data")
 async def get_data(
+    request: Request,
     source: str = Query(..., description="数据源，如 akshare"),
     symbol: str = Query(..., description="股票/基金代码"),
     data_type: str = Query(..., description="数据类型: nav|price|news|index|fundamental|daily"),
@@ -136,6 +137,34 @@ async def get_data(
                 if not row:
                     raise HTTPException(404, "未找到聚合新闻数据")
                 return row
+            elif data_type == "announcement":
+                days = 90
+                rows = db.get_announcements(symbol, days=days)
+                if not rows:
+                    raise HTTPException(404, f"未找到 {symbol} 的公告数据")
+                return {"symbol": symbol, "items": rows, "count": len(rows), "days": days}
+            elif data_type == "community":
+                days = 30
+                rows = db.get_community_posts(symbol, days=days)
+                if not rows:
+                    raise HTTPException(404, f"未找到 {symbol} 的社区数据")
+                return {"symbol": symbol, "items": rows, "count": len(rows), "days": days}
+            elif data_type == "fund_flow":
+                flow_type = request.query_params.get("flow_type", "main_fund_rank")
+                sector_kind = request.query_params.get("sector_kind")
+                days = int(request.query_params.get("days", 1))
+                limit = int(request.query_params.get("limit", 50))
+                rows = db.get_fund_flow(flow_type=flow_type, days=days, limit=limit)
+                if sector_kind:
+                    rows = [r for r in rows if r.get("sector_kind") == sector_kind]
+                if not rows:
+                    raise HTTPException(404, f"未找到 {flow_type} 数据")
+                return {"flow_type": flow_type, "sector_kind": sector_kind, "items": rows, "count": len(rows)}
+            elif data_type == "fundamental":
+                row = db.get_latest_fundamental(symbol)
+                if not row:
+                    raise HTTPException(404, f"未找到 {symbol} 的基本面数据")
+                return row
             else:
                 raise HTTPException(400, f"不支持的数据类型: {data_type}")
     except HTTPException:
@@ -176,6 +205,36 @@ async def get_news_aggregator():
         raise
     except Exception as e:
         logger.exception(f"聚合新闻查询失败: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/v1/news")
+async def get_news_by_symbol(
+    symbol: str = Query(..., description="股票代码"),
+    days: int = Query(7, ge=1, le=90, description="最近 N 天"),
+    source: str = Query(None, description="可选，按来源过滤 (akshare/rss/community_enhanced)")
+):
+    """按股票代码查询个股新闻（聚合 akshare + community_enhanced + rss）
+
+    返回该 symbol 在 news_data 表中的最近 N 天新闻。
+    注: news_data.symbol 由 collector 写入时填充，部分历史数据可能为空。
+    """
+    try:
+        from datetime import datetime, timezone, timedelta
+        TZ = timezone(timedelta(hours=8))
+        cutoff = (datetime.now(TZ) - timedelta(days=days)).isoformat()
+        cur = db.conn.execute("""
+            SELECT id, source, title, summary, link, symbol, published, ingested_at
+            FROM news_data
+            WHERE symbol = ? AND ingested_at >= ?
+              AND (? IS NULL OR source = ?)
+            ORDER BY ingested_at DESC
+            LIMIT 200
+        """, (symbol, cutoff, source, source))
+        rows = [dict(r) for r in cur.fetchall()]
+        return {"symbol": symbol, "days": days, "source": source, "items": rows, "count": len(rows)}
+    except Exception as e:
+        logger.exception(f"按 symbol 查新闻失败: {e}")
         raise HTTPException(500, str(e))
 
 # ==================== 订阅管理接口 ====================
