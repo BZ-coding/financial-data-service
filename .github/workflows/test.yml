@@ -1,0 +1,38 @@
+name: financial-data-service tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: market_service/requirements.txt
+
+      - name: Install deps (skip akshare — slow install, optional for smoke)
+        run: |
+          python -m pip install --upgrade pip
+          grep -v "^akshare" market_service/requirements.txt > /tmp/req.txt
+          pip install -r /tmp/req.txt
+          pip install pytest httpx
+
+      - name: Import smoke test
+        run: |
+          python -c "import market_service; from market_service import api, database; print('imports OK')"
+          python -c "from market_service.api import app; print('app loadable:', type(app).__name__)"
+
+      - name: Check script syntax (api.py, database.py, run.py, run_server_8084.py)
+        run: |
+          python -m py_compile market_service/api.py market_service/database.py market_service/run.py market_service/run_server_8084.py && echo "syntax OK"
