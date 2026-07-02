@@ -181,6 +181,22 @@ async def get_data(
                 code = symbol if symbol and symbol != "*" else None
                 rows = db.get_dragon_tiger(code=code, days=days, period=period)
                 return {"symbol": code, "period": period, "days": days, "items": rows, "count": len(rows)}
+            elif data_type == "stock_news":
+                # 个股新闻 (东方财富/雪球); 支持港股 fallback (akshare 无公告)
+                days = int(request.query_params.get("days", 30))
+                limit = int(request.query_params.get("limit", 50))
+                from datetime import datetime, timezone, timedelta
+                TZ = timezone(timedelta(hours=8))
+                cutoff = (datetime.now(TZ) - timedelta(days=days)).isoformat()
+                cur = db.conn.execute("""
+                    SELECT id, source, title, summary, link, symbol, published, ingested_at
+                    FROM news_data
+                    WHERE symbol = ? AND ingested_at >= ?
+                    ORDER BY ingested_at DESC
+                    LIMIT ?
+                """, (symbol, cutoff, limit))
+                rows = [dict(r) for r in cur.fetchall()]
+                return {"symbol": symbol, "days": days, "items": rows, "count": len(rows)}
             else:
                 raise HTTPException(400, f"不支持的数据类型: {data_type}")
     except HTTPException:
