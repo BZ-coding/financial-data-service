@@ -165,6 +165,22 @@ async def get_data(
                 if not row:
                     raise HTTPException(404, f"未找到 {symbol} 的基本面数据")
                 return row
+            elif data_type == "market_stats":
+                row = db.get_latest_market_stats()
+                if not row:
+                    raise HTTPException(404, "未找到市场涨跌统计 (sse+szse summary)")
+                return row
+            elif data_type == "limit_up_pool":
+                trade_date = request.query_params.get("trade_date")
+                limit = int(request.query_params.get("limit", 50))
+                rows = db.get_limit_up_pool(trade_date=trade_date, limit=limit)
+                return {"trade_date": trade_date, "items": rows, "count": len(rows)}
+            elif data_type == "dragon_tiger":
+                period = request.query_params.get("period")  # 今日/近一月/...
+                days = int(request.query_params.get("days", 30))
+                code = symbol if symbol and symbol != "*" else None
+                rows = db.get_dragon_tiger(code=code, days=days, period=period)
+                return {"symbol": code, "period": period, "days": days, "items": rows, "count": len(rows)}
             else:
                 raise HTTPException(400, f"不支持的数据类型: {data_type}")
     except HTTPException:

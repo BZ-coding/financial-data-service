@@ -980,3 +980,141 @@ class AKShareFetcher(BaseCollector):
             self.logger.error(f"_fetch_minute_bars_sina({symbol})异常: {e}")
             return None
 
+
+
+    # ==================== PHASE 2 新增 ====================
+
+    def _fetch_market_stats_sync(self) -> Optional[Dict[str, Any]]:
+        """合并 stock_sse_summary + stock_szse_summary, 得到交易所权威统计
+
+        返回: {trade_date, sse_*, szse_*, total_*, raw}
+        注: 不含涨/跌家数 (ak.stock_market_activity_legu 接口当前不可用)
+        """
+        def _to_num(v, default=None):
+            """SSE 返回值是 str, SZSE 是 int/float, 统一转 float"""
+            if v is None or v == '':
+                return default
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return default
+
+        try:
+            import akshare as ak
+            sse = ak.stock_sse_summary()
+            szse = ak.stock_szse_summary()
+            from datetime import datetime, timezone, timedelta
+            TZ = timezone(timedelta(hours=8))
+            trade_date = datetime.now(TZ).strftime('%Y-%m-%d')
+
+            # SSE: 项目, 股票, 主板, 科创板 (col 值是 str)
+            sse_dict = {}
+            if sse is not None and not sse.empty:
+                for _, r in sse.iterrows():
+                    sse_dict[str(r['项目']).strip()] = r['股票']
+
+            # SZSE: 找"股票"行
+            szse_dict = {}
+            if szse is not None and not szse.empty:
+                stock_row = szse[szse['证券类别'] == '股票']
+                if not stock_row.empty:
+                    sr = stock_row.iloc[0]
+                    szse_dict = {
+                        'count': int(sr['数量']) if sr['数量'] else 0,
+                        'amount': float(sr['成交金额']) if sr['成交金额'] else 0.0,
+                        'total_mv': float(sr['总市值']) if sr['总市值'] else 0.0,
+                        'circ_mv': float(sr['流通市值']) if sr['流通市值'] else 0.0,
+                    }
+
+            sse_listed = _to_num(sse_dict.get('上市公司'), 0) or 0
+            sse_total_mv = _to_num(sse_dict.get('总市值'), 0) or 0
+            szse_total_mv = szse_dict.get('total_mv', 0) or 0
+
+            return {
+                'trade_date': trade_date,
+                'sse_listed_count': int(sse_listed) if sse_listed else None,
+                'sse_stock_count': int(_to_num(sse_dict.get('上市股票'))) if sse_dict.get('上市股票') else None,
+                'sse_total_mv': sse_total_mv,
+                'sse_circ_mv': _to_num(sse_dict.get('流通市值')),
+                'sse_avg_pe': _to_num(sse_dict.get('平均市盈率')),
+                'szse_stock_count': szse_dict.get('count'),
+                'szse_total_mv': szse_total_mv,
+                'szse_circ_mv': szse_dict.get('circ_mv'),
+                'szse_amount': szse_dict.get('amount'),
+                'total_listed_count': int(sse_listed) + szse_dict.get('count', 0),
+                'total_mv': sse_total_mv + szse_total_mv,
+                'raw': {
+                    'sse': sse.to_dict(orient='records') if sse is not None else None,
+                    'szse': szse.to_dict(orient='records') if szse is not None else None,
+                },
+            }
+        except Exception as e:
+            self.logger.error(f"_fetch_market_stats_sync 失败: {e}")
+            return None
+
+    def _fetch_limit_up_pool_sync(self, trade_date: str, n: int = 50) -> Optional[List[Dict[str, Any]]]:
+        """涨停池 (ak.stock_zt_pool_em, 限最近 30 交易日)
+
+        trade_date: YYYYMMDD (例 20250702)
+        返回: [{trade_date, code, name, price, change_pct, amount, limit_times, first_limit_time, last_limit_time, raw}, ...]
+        """
+        try:
+            import akshare as ak
+            df = ak.stock_zt_pool_em(date=trade_date)
+            if df is None or df.empty:
+                return []
+            items = []
+            for _, r in df.head(n).iterrows():
+                # 列名实际: ['序号', '代码', '名称', '涨跌幅', '最新价', '成交额', '流通市值', '总市值', '换手率', '封板资金', '首次封板时间', '最后封板时间', '炸板次数', '涨停统计', '连板数', '所属行业']
+                items.append({
+                    'trade_date': f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}",
+                    'code': str(r.get('代码', '')),
+                    'name': str(r.get('名称', '')),
+                    'price': float(r['最新价']) if r.get('最新价') not in (None, '') else None,
+                    'change_pct': float(r['涨跌幅']) if r.get('涨跌幅') not in (None, '') else None,
+                    'amount': float(r['成交额']) if r.get('成交额') not in (None, '') else None,
+                    'limit_times': int(r['连板数']) if r.get('连板数') not in (None, '') and str(r.get('连板数', '')).isdigit() else None,
+                    'first_limit_time': str(r['首次封板时间']) if r.get('首次封板时间') else None,
+                    'last_limit_time': str(r['最后封板时间']) if r.get('最后封板时间') else None,
+                    'raw': r.to_dict() if hasattr(r, 'to_dict') else None,
+                })
+            self.logger.info(f"_fetch_limit_up_pool_sync({trade_date}) 返回 {len(items)} 条")
+            return items
+        except Exception as e:
+            self.logger.error(f"_fetch_limit_up_pool_sync({trade_date}) 失败: {e}")
+            return None
+
+    def _fetch_dragon_tiger_today_sync(self) -> Optional[List[Dict[str, Any]]]:
+        """龙虎榜-当日详情 (ak.stock_lhb_detail_em, 637 行 21 列)
+
+        返回: [{trade_date, code, name, close_price, change_pct,
+                  net_buy_amount, buy_amount, sell_amount, total_amount, raw}, ...]
+        """
+        try:
+            import akshare as ak
+            df = ak.stock_lhb_detail_em()
+            if df is None or df.empty:
+                return []
+            from datetime import datetime, timezone, timedelta
+            TZ = timezone(timedelta(hours=8))
+            trade_date = datetime.now(TZ).strftime('%Y-%m-%d')
+            items = []
+            for _, r in df.iterrows():
+                items.append({
+                    'trade_date': trade_date,
+                    'period': '今日',
+                    'code': str(r.get('代码', '')),
+                    'name': str(r.get('名称', '')),
+                    'close_price': float(r['收盘价']) if r.get('收盘价') not in (None, '') else None,
+                    'change_pct': float(r['涨跌幅']) if r.get('涨跌幅') not in (None, '') else None,
+                    'net_buy_amount': float(r['龙虎榜净买额']) if r.get('龙虎榜净买额') not in (None, '') else None,
+                    'buy_amount': float(r['龙虎榜买入额']) if r.get('龙虎榜买入额') not in (None, '') else None,
+                    'sell_amount': float(r['龙虎榜卖出额']) if r.get('龙虎榜卖出额') not in (None, '') else None,
+                    'total_amount': float(r['龙虎榜总成交额']) if r.get('龙虎榜总成交额') not in (None, '') else None,
+                    'raw': r.to_dict() if hasattr(r, 'to_dict') else None,
+                })
+            self.logger.info(f"_fetch_dragon_tiger_today_sync 返回 {len(items)} 条")
+            return items
+        except Exception as e:
+            self.logger.error(f"_fetch_dragon_tiger_today_sync 失败: {e}")
+            return None

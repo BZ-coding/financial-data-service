@@ -131,6 +131,41 @@ class Database:
             migrations.append("CREATE INDEX idx_daily_lookup ON daily_data(symbol, trade_date DESC)")
             migrations.append("CREATE INDEX idx_daily_cleanup ON daily_data(ingested_at)")
 
+            # Phase 2 新增表 (commit 2)
+            migrations.append("""CREATE TABLE IF NOT EXISTS market_stats_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_date DATE UNIQUE NOT NULL,
+                sse_listed_count INTEGER, sse_stock_count INTEGER,
+                sse_total_mv REAL, sse_circ_mv REAL, sse_avg_pe REAL,
+                szse_stock_count INTEGER, szse_total_mv REAL, szse_circ_mv REAL, szse_amount REAL,
+                total_listed_count INTEGER, total_mv REAL,
+                raw_data TEXT, ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )""")
+            migrations.append("CREATE INDEX IF NOT EXISTS idx_market_stats_date ON market_stats_data(trade_date DESC)")
+
+            migrations.append("""CREATE TABLE IF NOT EXISTS limit_up_pool_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_date DATE NOT NULL, code TEXT NOT NULL,
+                name TEXT, price REAL, change_pct REAL, amount REAL,
+                limit_times INTEGER, first_limit_time TEXT, last_limit_time TEXT,
+                raw_data TEXT, ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(trade_date, code)
+            )""")
+            migrations.append("CREATE INDEX IF NOT EXISTS idx_limit_up_lookup ON limit_up_pool_data(trade_date DESC, change_pct DESC)")
+            migrations.append("CREATE INDEX IF NOT EXISTS idx_limit_up_cleanup ON limit_up_pool_data(ingested_at)")
+
+            migrations.append("""CREATE TABLE IF NOT EXISTS dragon_tiger_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_date DATE NOT NULL, code TEXT NOT NULL, name TEXT,
+                close_price REAL, change_pct REAL,
+                net_buy_amount REAL, buy_amount REAL, sell_amount REAL, total_amount REAL,
+                period TEXT, list_count INTEGER, inst_buy_net REAL,
+                raw_data TEXT, ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(trade_date, code, period)
+            )""")
+            migrations.append("CREATE INDEX IF NOT EXISTS idx_dragon_tiger_lookup ON dragon_tiger_data(trade_date DESC, code)")
+            migrations.append("CREATE INDEX IF NOT EXISTS idx_dragon_tiger_code ON dragon_tiger_data(code, trade_date DESC)")
+
         for stmt in migrations:
             try:
                 logger.info(f"执行迁移: {stmt}")
@@ -1424,6 +1459,139 @@ class Database:
         except Exception as e:
             logger.error(f"set_source_degraded 失败: {e}")
             return False
+
+    # ==================== MARKET STATS (Phase 2 新增) ====================
+
+    def save_market_stats(self, data: Dict[str, Any]) -> bool:
+        """保存市场涨跌统计 (sse+szse summary 合并)"""
+        try:
+            self.conn.execute("""
+                INSERT OR REPLACE INTO market_stats_data (
+                    trade_date,
+                    sse_listed_count, sse_stock_count, sse_total_mv, sse_circ_mv, sse_avg_pe,
+                    szse_stock_count, szse_total_mv, szse_circ_mv, szse_amount,
+                    total_listed_count, total_mv, raw_data
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                data.get('trade_date'),
+                data.get('sse_listed_count'), data.get('sse_stock_count'),
+                data.get('sse_total_mv'), data.get('sse_circ_mv'), data.get('sse_avg_pe'),
+                data.get('szse_stock_count'), data.get('szse_total_mv'),
+                data.get('szse_circ_mv'), data.get('szse_amount'),
+                data.get('total_listed_count'), data.get('total_mv'),
+                json.dumps(data.get('raw', {}), ensure_ascii=False) if data.get('raw') else None
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"save_market_stats 失败: {e}")
+            return False
+
+    def get_latest_market_stats(self) -> Optional[Dict[str, Any]]:
+        """获取最新一期市场涨跌统计"""
+        cur = self.conn.execute("""
+            SELECT * FROM market_stats_data ORDER BY trade_date DESC LIMIT 1
+        """)
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    # ==================== LIMIT UP POOL (Phase 2 新增) ====================
+
+    def save_limit_up_pool(self, data_list: List[Dict[str, Any]]) -> int:
+        """批量保存涨停池 (trade_date, items[])"""
+        if not data_list:
+            return 0
+        saved = 0
+        try:
+            for d in data_list:
+                self.conn.execute("""
+                    INSERT OR REPLACE INTO limit_up_pool_data (
+                        trade_date, code, name, price, change_pct, amount,
+                        limit_times, first_limit_time, last_limit_time, raw_data
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    d.get('trade_date'), d.get('code'), d.get('name'),
+                    d.get('price'), d.get('change_pct'), d.get('amount'),
+                    d.get('limit_times'), d.get('first_limit_time'), d.get('last_limit_time'),
+                    json.dumps(d.get('raw', {}), ensure_ascii=False) if d.get('raw') else None
+                ))
+                saved += 1
+            self.conn.commit()
+            return saved
+        except Exception as e:
+            logger.error(f"save_limit_up_pool 失败: {e}")
+            return saved
+
+    def get_limit_up_pool(self, trade_date: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """获取涨停池 (默认最新交易日)"""
+        if trade_date:
+            cur = self.conn.execute("""
+                SELECT * FROM limit_up_pool_data
+                WHERE trade_date = ?
+                ORDER BY change_pct DESC LIMIT ?
+            """, (trade_date, limit))
+        else:
+            cur = self.conn.execute("""
+                SELECT * FROM limit_up_pool_data
+                WHERE trade_date = (SELECT MAX(trade_date) FROM limit_up_pool_data)
+                ORDER BY change_pct DESC LIMIT ?
+            """, (limit,))
+        return [dict(r) for r in cur.fetchall()]
+
+    # ==================== DRAGON TIGER (Phase 2 新增) ====================
+
+    def save_dragon_tiger(self, data_list: List[Dict[str, Any]]) -> int:
+        """批量保存龙虎榜 (trade_date, items[])"""
+        if not data_list:
+            return 0
+        saved = 0
+        try:
+            for d in data_list:
+                self.conn.execute("""
+                    INSERT OR REPLACE INTO dragon_tiger_data (
+                        trade_date, code, name,
+                        close_price, change_pct,
+                        net_buy_amount, buy_amount, sell_amount, total_amount,
+                        period, list_count, inst_buy_net, raw_data
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    d.get('trade_date'), d.get('code'), d.get('name'),
+                    d.get('close_price'), d.get('change_pct'),
+                    d.get('net_buy_amount'), d.get('buy_amount'),
+                    d.get('sell_amount'), d.get('total_amount'),
+                    d.get('period', '今日'), d.get('list_count'), d.get('inst_buy_net'),
+                    json.dumps(d.get('raw', {}), ensure_ascii=False, default=str) if d.get('raw') else None
+                ))
+                saved += 1
+            self.conn.commit()
+            return saved
+        except Exception as e:
+            logger.error(f"save_dragon_tiger 失败: {e}")
+            return saved
+
+    def get_dragon_tiger(self, code: Optional[str] = None, days: int = 30,
+                          period: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """获取龙虎榜数据
+        code:  按股票代码过滤 (None=全部)
+        days: 最近 N 天
+        period: 按 period 过滤 (今日/近一月/...)
+        """
+        from datetime import datetime, timezone, timedelta
+        TZ = timezone(timedelta(hours=8))
+        cutoff = (datetime.now(TZ) - timedelta(days=days)).strftime('%Y-%m-%d')
+
+        sql = "SELECT * FROM dragon_tiger_data WHERE trade_date >= ?"
+        params = [cutoff]
+        if code:
+            sql += " AND code = ?"
+            params.append(code)
+        if period:
+            sql += " AND period = ?"
+            params.append(period)
+        sql += " ORDER BY trade_date DESC, net_buy_amount DESC LIMIT ?"
+        params.append(limit)
+        cur = self.conn.execute(sql, params)
+        return [dict(r) for r in cur.fetchall()]
 
     def close(self):
         """关闭连接"""

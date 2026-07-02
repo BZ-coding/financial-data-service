@@ -312,3 +312,80 @@ CREATE TABLE IF NOT EXISTS fund_flow_data (
 );
 CREATE INDEX IF NOT EXISTS idx_fund_flow_lookup ON fund_flow_data(flow_type, rank_data DESC, rank_no);
 CREATE INDEX IF NOT EXISTS idx_fund_flow_cleanup ON fund_flow_data(collected_at);
+
+-- ============================================
+-- 市场涨跌统计表 (Phase 2 新增)
+-- 数据源: ak.stock_sse_summary + ak.stock_szse_summary 合并
+-- ============================================
+CREATE TABLE IF NOT EXISTS market_stats_data (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_date DATE UNIQUE NOT NULL,
+    -- 上交所
+    sse_listed_count INTEGER,           -- 上市公司数
+    sse_stock_count INTEGER,            -- 上市股票数
+    sse_total_mv REAL,                  -- 总市值 (亿)
+    sse_circ_mv REAL,                   -- 流通市值 (亿)
+    sse_avg_pe REAL,                    -- 平均市盈率
+    -- 深交所
+    szse_stock_count INTEGER,
+    szse_total_mv REAL,
+    szse_circ_mv REAL,
+    szse_amount REAL,                   -- 成交金额
+    -- 汇总
+    total_listed_count INTEGER,
+    total_mv REAL,
+    raw_data TEXT,
+    ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_market_stats_date ON market_stats_data(trade_date DESC);
+
+-- ============================================
+-- 涨停池表 (Phase 2 新增)
+-- 数据源: ak.stock_zt_pool_em(date=YYYYMMDD)
+-- 仅保留最近 30 个交易日
+-- ============================================
+CREATE TABLE IF NOT EXISTS limit_up_pool_data (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_date DATE NOT NULL,
+    code TEXT NOT NULL,
+    name TEXT,
+    price REAL,
+    change_pct REAL,
+    amount REAL,                        -- 成交额
+    limit_times INTEGER,                -- 连板次数
+    first_limit_time TEXT,              -- 首次涨停时间
+    last_limit_time TEXT,               -- 最后涨停时间
+    raw_data TEXT,
+    ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(trade_date, code)
+);
+CREATE INDEX IF NOT EXISTS idx_limit_up_lookup ON limit_up_pool_data(trade_date DESC, change_pct DESC);
+CREATE INDEX IF NOT EXISTS idx_limit_up_cleanup ON limit_up_pool_data(ingested_at);
+
+-- ============================================
+-- 龙虎榜表 (Phase 2 新增)
+-- 数据源: ak.stock_lhb_detail_em() 默认当日 + ak.stock_lhb_stock_statistic_em(period)
+-- ============================================
+CREATE TABLE IF NOT EXISTS dragon_tiger_data (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_date DATE NOT NULL,
+    code TEXT NOT NULL,
+    name TEXT,
+    -- 当日上榜详情 (stock_lhb_detail_em)
+    close_price REAL,
+    change_pct REAL,
+    net_buy_amount REAL,                -- 龙虎榜净买额
+    buy_amount REAL,                    -- 买入额
+    sell_amount REAL,                   -- 卖出额
+    total_amount REAL,
+    -- 累计统计 (stock_lhb_stock_statistic_em)
+    period TEXT,                         -- 近一月/近三月/近六月/近一年
+    list_count INTEGER,                  -- 上榜次数
+    inst_buy_net REAL,                   -- 机构买入净额
+    -- 其他
+    raw_data TEXT,
+    ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(trade_date, code, period)
+);
+CREATE INDEX IF NOT EXISTS idx_dragon_tiger_lookup ON dragon_tiger_data(trade_date DESC, code);
+CREATE INDEX IF NOT EXISTS idx_dragon_tiger_code ON dragon_tiger_data(code, trade_date DESC);
