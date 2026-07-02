@@ -11,3 +11,4 @@ logs/
 *.log
 .env
 .DS_Store
+market_data_service.tar.gz
