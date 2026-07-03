@@ -36,3 +36,7 @@ jobs:
       - name: Check script syntax (api.py, database.py, run.py, run_server_8084.py)
         run: |
           python -m py_compile market_service/api.py market_service/database.py market_service/run.py market_service/run_server_8084.py && echo "syntax OK"
+
+      - name: Pytest (eastmoney fields regression + other unit tests)
+        run: |
+          python -m pytest tests/ -v --tb=short

@@ -30,11 +30,13 @@ logger = logging.getLogger(__name__)
 class EastMoneyCollector(BaseCollector):
     """东方财富数据采集器"""
 
-    # 字段索引（东方财富 push2.eastmoney.com API）
+    # 字段索引（东方财富 push2.eastmoney.com / push2delay.eastmoney.com API，stock/get 单股接口）
     # f43=当前价, f44=最高, f45=最低, f46=今开, f47=成交量
     # f48=成交额, f50=换手率, f57=股票代码, f58=股票名称
-    # f107=涨跌额, f169=市场类型（MktLineL3.0有）, f170=更新时间
-    EM_FIELDS = "f43,f44,f45,f46,f47,f48,f50,f57,f58,f107"
+    # f60=昨收, f107=已失效(2026-07-03 验证, A股=0/1, 港股=secid前缀)
+    # f169=涨跌额 (=price - prev_close, 实测100%一致), f170=涨跌幅%
+    # pitfall 2026-07-03: f107 字段在 push2 / push2delay 都已失效, 不要再用, 改用 f169
+    EM_FIELDS = "f43,f44,f45,f46,f47,f48,f50,f57,f58,f60,f169,f170"
 
     def __init__(self, rate_limit_per_minute: int = 60):
         BaseCollector.__init__(self, rate_limit_per_minute)
@@ -95,22 +97,21 @@ class EastMoneyCollector(BaseCollector):
         }
         data = self._get(self.base_url, params)
         if not data:
-            return CollectResult(success=False, source="eastmoney", symbol=symbol, data_type="price", error="请求失败")
+            return CollectResult(success=False, data=None, source="eastmoney", symbol=symbol, data_type="price", error="请求失败")
         try:
             rc = data.get("rc", -1)
             if rc != 0:
-                return CollectResult(success=False, source="eastmoney", symbol=symbol, data_type="price", error=f"RC={rc}")
+                return CollectResult(success=False, data=None, source="eastmoney", symbol=symbol, data_type="price", error=f"RC={rc}")
             raw = data.get("data", {})
             if not raw:
-                return CollectResult(success=False, source="eastmoney", symbol=symbol, data_type="price", error="无数据")
+                return CollectResult(success=False, data=None, source="eastmoney", symbol=symbol, data_type="price", error="无数据")
             price = raw.get("f43")
             if price is None or price == 0:
-                return CollectResult(success=False, source="eastmoney", symbol=symbol, data_type="price", error="价格为空")
-            # 涨跌额
-            change_amt = raw.get("f107")
-            # 涨跌额没有的话从当前价和昨收算
-            prev_close = raw.get("f60")  # 昨收（如果有的话）
-            if change_amt is None and prev_close:
+                return CollectResult(success=False, data=None, source="eastmoney", symbol=symbol, data_type="price", error="价格为空")
+            # 涨跌额 (pitfall 2026-07-03: f107 在 push2 / push2delay 都已失效, 改用 f169)
+            change_amt = raw.get("f169")
+            prev_close = raw.get("f60")  # 昨收（f60, 实测可用, 用于 f169 缺失时回退）
+            if change_amt is None and price is not None and prev_close:
                 change_amt = round(price - prev_close, 2)
             result = {
                 "symbol": symbol,
@@ -131,7 +132,7 @@ class EastMoneyCollector(BaseCollector):
             return CollectResult(success=True, data=[result], source="eastmoney", symbol=symbol, data_type="price", duration_seconds=duration)
         except Exception as e:
             self.logger.warning(f"EastMoney price 解析失败 {symbol}: {e}")
-            return CollectResult(success=False, source="eastmoney", symbol=symbol, data_type="price", error=str(e))
+            return CollectResult(success=False, data=None, source="eastmoney", symbol=symbol, data_type="price", error=str(e))
 
     async def collect(self, data_type: str, symbol: str, **kwargs) -> CollectResult:
         if data_type == "price":
