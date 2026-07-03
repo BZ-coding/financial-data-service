@@ -22,7 +22,9 @@ import yaml
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 from market_service.database import Database, now_tz, parse_date
-from market_service.collectors.akshare import AKShareFetcher
+# 注: 原先有 `from market_service.collectors.akshare import AKShareFetcher`,
+# 但实际从未引用 (grep 全文件无 usage). 删除以避免 CI smoke test
+# 依赖 akshare 时的 ModuleNotFoundError. 2026-07-03 修复.
 
 from .database import Database, now_tz, parse_date
 from .scheduler import Scheduler
