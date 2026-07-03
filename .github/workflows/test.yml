@@ -21,11 +21,10 @@ jobs:
           cache: "pip"
           cache-dependency-path: market_service/requirements.txt
 
-      - name: Install deps (skip akshare — slow install, optional for smoke)
+      - name: Install deps (full — smoke test imports market_service.api which transitively imports akshare via scheduler)
         run: |
           python -m pip install --upgrade pip
-          grep -v "^akshare" market_service/requirements.txt > /tmp/req.txt
-          pip install -r /tmp/req.txt
+          pip install -r market_service/requirements.txt
           pip install pytest httpx
 
       - name: Import smoke test
