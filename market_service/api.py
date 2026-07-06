@@ -200,6 +200,22 @@ async def get_data(
                 """, (symbol, cutoff, limit))
                 rows = [dict(r) for r in cur.fetchall()]
                 return {"symbol": symbol, "days": days, "items": rows, "count": len(rows)}
+            elif data_type == "hkex_announcement":
+                # 港交所披露易公告 (Phase 7, 2026-07-06) — source='hkex' 区分 stock_news
+                days = int(request.query_params.get("days", 90))
+                limit = int(request.query_params.get("limit", 50))
+                from datetime import datetime, timezone, timedelta
+                TZ = timezone(timedelta(hours=8))
+                cutoff = (datetime.now(TZ) - timedelta(days=days)).isoformat()
+                cur = db.conn.execute("""
+                    SELECT id, source, title, summary, link, symbol, published, ingested_at
+                    FROM news_data
+                    WHERE symbol = ? AND source = 'hkex' AND ingested_at >= ?
+                    ORDER BY ingested_at DESC
+                    LIMIT ?
+                """, (symbol, cutoff, limit))
+                rows = [dict(r) for r in cur.fetchall()]
+                return {"symbol": symbol, "days": days, "items": rows, "count": len(rows), "source_filter": "hkex"}
             else:
                 raise HTTPException(400, f"不支持的数据类型: {data_type}")
     except HTTPException:

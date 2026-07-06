@@ -74,6 +74,7 @@ class ChainCollector:
         "stock_basic":  ["tushare", "akshare"],
         "stock_news":   ["community_enhanced"],  # 个股新闻（东方财富搜索API / 雪球）
         "xueqiu_hot":   ["community_enhanced"],  # 雪球热帖
+        "hkex_announcement": ["hkex_enhanced"],   # 港交所披露易公告 (港股标的专属)
     }
 
     # 连续失败 N 次触发降级
@@ -252,8 +253,12 @@ class ChainCollector:
         config: Dict[str, Any],
     ) -> CollectResult:
         """对单个信源尝试采集，带超时"""
+        # Phase 7 (2026-07-06): HKEX 单次 13-25s + SSL 慢, 15s 默认超时不够
+        # 走 slow_sources 名单, 给更长 timeout
+        SLOW_SOURCES = {"hkex_enhanced"}
+        timeout_sec = 60 if source in SLOW_SOURCES else 15
         try:
-            async with asyncio.timeout(15):
+            async with asyncio.timeout(timeout_sec):
                 result = await collector.collect_with_retry(
                     symbol=symbol,
                     data_type=data_type,

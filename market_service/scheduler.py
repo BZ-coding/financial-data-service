@@ -22,6 +22,7 @@ from .collectors.mmx_search import MmxSearchCollector
 from .collectors.sina import SinaCollector
 from .collectors.eastmoney import EastMoneyCollector
 from .collectors.community_enhanced import CommunityEnhancedCollector
+from .collectors.hkex_enhanced import HkexEnhancedCollector
 from .collectors.zhihu import ZhihuCollector
 from .collectors.router import CollectorRouter
 from .collectors.chain import ChainCollector
@@ -72,6 +73,9 @@ class Scheduler:
             ),
             'community_enhanced': CommunityEnhancedCollector(
                 rate_limit_per_minute=self.config['collectors'].get('community_enhanced', {}).get('rate_limit_per_minute', 20)
+            ),
+            'hkex_enhanced': HkexEnhancedCollector(
+                rate_limit_per_minute=self.config['collectors'].get('hkex_enhanced', {}).get('rate_limit_per_minute', 10)
             ),
             'zhihu': ZhihuCollector(
                 rate_limit_per_minute=self.config['collectors'].get('zhihu', {}).get('rate_limit_per_minute', 30),
@@ -160,6 +164,20 @@ class Scheduler:
                     }
                     self.db.insert_news(news_item)
                     stored += 1
+                elif data_type == 'hkex_announcement':
+                    # 港交所披露易公告 (Phase 7, 2026-07-06) — 复用 news_data 表
+                    # source='hkex' 区分于 stock_news ('em_search')
+                    news_item = {
+                        'source': 'hkex',
+                        'title': item.get('title', ''),
+                        'summary': item.get('summary', ''),
+                        'link': item.get('link') or item.get('url', ''),
+                        'symbol': result.symbol,
+                        'published': item.get('published', ''),
+                    }
+                    if news_item['link']:
+                        self.db.insert_news(news_item)
+                        stored += 1
                 elif data_type == 'xueqiu_hot':
                     # 雪球热帖，存入 community_data 表
                     # 注意：follow_count 可能是 NaN/None，int() 会抛 ValueError
@@ -465,6 +483,7 @@ class Scheduler:
             "hsgt", "stock_basic",
             "stock_news",   # 个股新闻（东方财富搜索API / 雪球）—— 走 community_enhanced
             "xueqiu_hot",   # 雪球热帖 —— 走 community_enhanced
+            "hkex_announcement",  # 港交所披露易公告 (港股标的专属) —— 走 hkex_enhanced
         }
 
         # 对每个data_type执行采集
