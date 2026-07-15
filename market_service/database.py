@@ -727,7 +727,7 @@ class Database:
             data.get('low'),
             data.get('open'),
             data.get('prev_close'),
-            data.get('source', 'tencent_sina'),
+            data.get('source', 'akshare'),
             trade_date,
             data.get('timestamp')
         ))

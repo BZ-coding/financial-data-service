@@ -435,9 +435,13 @@ class AKShareFetcher(BaseCollector):
         }
 
     def _normalize_index(self, raw: Dict[str, Any]) -> Dict[str, Any]:
-        """标准化指数数据"""
+        """标准化指数数据（pitfall #37 修复：source 标签实际是 akshare 的 sina 接口，不是 tencent）
+
+        历史实现里这里写死 'tencent_sina'，但 `_fetch_index_data_sync` 实际调的是
+        `ak.stock_zh_index_spot_sina()`，所以正确的 source 应该是 'akshare'。
+        """
         return {
-            'source': 'tencent_sina',
+            'source': 'akshare',
             'code': raw.get('code', ''),
             'name': raw.get('name', ''),
             'data_type': 'index',

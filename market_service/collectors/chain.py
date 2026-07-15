@@ -443,26 +443,34 @@ class ChainCollector:
             for item in items
         ]
 
-    def _transform_index(self, raw, source: str) -> Dict[str, Any]:
-        """标准化 index 数据"""
-        item = raw[0] if isinstance(raw, list) else raw
-        return {
-            "source": source,
-            "code": item["code"],
-            "name": item.get("name", ""),
-            "price": item.get("price"),
-            "change_pct": item.get("change_pct"),
-            "change_amount": item.get("change_amount"),
-            "volume": item.get("volume"),
-            "amount": item.get("amount"),
-            "high": item.get("high"),
-            "low": item.get("low"),
-            "open": item.get("open"),
-            "prev_close": item.get("prev_close"),
-            "trade_date": item.get("trade_date"),
-            "trade_time": item.get("trade_time"),
-            "raw": item,
-        }
+    def _transform_index(self, raw, source: str) -> List[Dict[str, Any]]:
+        """标准化 index 数据（返回列表 — 一次 collect 拉所有大盘指数，pitfall #37 修复）
+
+        此前 `_transform_index` 用 `raw[0]` 把 list 折叠成单条 dict，导致
+        scheduler 每次只入库第一个指数（sh000001），其余 4 个指数卡死在 7-01，
+        现象就是 22:00 复盘报告里 pitfall #37 反复复发。
+        """
+        items = raw if isinstance(raw, list) else [raw]
+        result = []
+        for item in items:
+            result.append({
+                "source": source,
+                "code": item.get("code", ""),
+                "name": item.get("name", ""),
+                "price": item.get("price"),
+                "change_pct": item.get("change_pct"),
+                "change_amount": item.get("change_amount"),
+                "volume": item.get("volume"),
+                "amount": item.get("amount"),
+                "high": item.get("high"),
+                "low": item.get("low"),
+                "open": item.get("open"),
+                "prev_close": item.get("prev_close"),
+                "trade_date": item.get("trade_date"),
+                "trade_time": item.get("trade_time"),
+                "raw": item,
+            })
+        return result
 
     def _transform_community(self, raw, source: str) -> List[Dict[str, Any]]:
         """标准化 community 数据"""
