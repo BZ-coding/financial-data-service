@@ -500,8 +500,21 @@ class ChainCollector:
         is_transform_error: bool = False,
         duration: float = 0.0,
     ):
-        """更新 source_metrics"""
+        """更新 source_metrics
+
+        pitfall 2026-07-29: duration 必须是 float，DB schema 强类型约束。
+        之前任一调用方传 str/int 在 async handler 里抛 TypeError，事件循环被
+        吞掉的异常持续累积，最终 aiohttp 死锁 → 8084 hang（recv_q 累积 478），
+        持续 13 天不重启就 100% 复现。修法：调用前强制 float() 转换并捕获
+        异常转 DEBUG（避免每次采集合规刷 WARNING）。
+        """
         try:
+            # 1. 强制类型转换（防止 DB 抛 TypeError '>=' not supported str/int）
+            try:
+                duration = float(duration) if duration is not None else 0.0
+            except (TypeError, ValueError):
+                duration = 0.0
+
             self.db.upsert_source_metric(
                 source=source,
                 data_type=data_type,
@@ -509,10 +522,14 @@ class ChainCollector:
                 is_transform_error=is_transform_error,
                 duration=duration,
             )
-            # 检查是否需要降级
-            self._check_degrade(source, data_type)
+            # 检查是否需要降级（自己 try 一遍避免 metric 失败连带 degrade 失败）
+            try:
+                self._check_degrade(source, data_type)
+            except Exception as e:
+                logger.debug(f"_check_degrade 内部失败（已容忍）: {e}")
         except Exception as e:
-            logger.warning(f"_record_metric failed: {e}")
+            # 降级到 DEBUG —— metric 失败不应阻塞主流程，WARNING 刷屏会掩盖真问题
+            logger.debug(f"_record_metric failed: {e}")
 
     # 连续成功多少次自动解除降级
     RECOVER_CONSECUTIVE_SUCCESS = 10

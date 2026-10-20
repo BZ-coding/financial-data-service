@@ -198,7 +198,14 @@ class CommunityEnhancedCollector(BaseCollector):
     # ========== 主力资金榜 / 板块资金流 (mcp-eastmoney 同源 API) ==========
 
     def _get_with_backoff(self, url: str, headers=None, timeout=10, max_retries=3):
-        """GET 请求 + 指数退避重试 (针对 EM push2 IP 封禁)"""
+        """GET 请求 + 指数退避重试 (针对 EM push2 IP 封禁)
+
+        pitfall 2026-07-29: 这是同步实现, 必须在 async handler 里通过
+        `await asyncio.to_thread(self._get_with_backoff, ...)` 调用,
+        否则 `time.sleep` + `requests.get` 会阻塞整个 aiohttp 事件循环,
+        进而引发 8084 hang (recv_q 累积 478 = 死锁强证据)。
+        同步入口本身保留便于 unit-test 单独跑。
+        """
         import time as _time
         last_err = None
         for attempt in range(max_retries):
@@ -214,12 +221,15 @@ class CommunityEnhancedCollector(BaseCollector):
             _time.sleep(wait)
         raise Exception(f"重试 {max_retries} 次仍失败: {last_err}")
 
-    def _fetch_main_fund_rank(self, top_n: int = 20) -> Optional[List[Dict[str, Any]]]:
+    def _fetch_main_fund_rank(self, top_n: int = 20, timeout: int = 5, max_retries: int = 1) -> Optional[List[Dict[str, Any]]]:
         """
         主力资金净流入 Top N (东方财富 push2delay 接口, mcp-eastmoney 同源)
         fields: f12=code, f14=name, f2=price, f3=change_pct×100,
                 f62=main_net_inflow(元), f184=main_net_pct×100,
                 f66=super_large, f70=large, f76=medium, f78=small
+
+        pitfall 2026-07-29: timeout=5, max_retries=1 取代默认 (10, 3)
+        —— EM push2delay IP 限流严格, 繁忙时段 3 次重试会拖垮 aiohttp 事件循环。
         """
         try:
             import time as _time
@@ -233,7 +243,7 @@ class CommunityEnhancedCollector(BaseCollector):
                 f"&fields=f12,f14,f2,f3,f62,f184,f66,f70,f76,f78"
                 f"&req_trace={ts}&_={ts}"
             )
-            resp = self._get_with_backoff(url, headers={"Referer": "https://quote.eastmoney.com/"})
+            resp = self._get_with_backoff(url, headers={"Referer": "https://quote.eastmoney.com/"}, timeout=timeout, max_retries=max_retries)
             data = resp.json()
             diff = (data.get("data") or {}).get("diff") or []
             items = []
@@ -261,7 +271,7 @@ class CommunityEnhancedCollector(BaseCollector):
             self.logger.warning(f"_fetch_main_fund_rank 异常: {e}")
             return None
 
-    def _fetch_sector_fund_flow(self, kind: str = "industry", top_n: int = 15) -> Optional[List[Dict[str, Any]]]:
+    def _fetch_sector_fund_flow(self, kind: str = "industry", top_n: int = 15, timeout: int = 5, max_retries: int = 1) -> Optional[List[Dict[str, Any]]]:
         """
         板块资金流 (industry/concept)
         fields: f12=code, f14=name, f3=change_pct×100,
@@ -279,7 +289,7 @@ class CommunityEnhancedCollector(BaseCollector):
                 f"&fields=f12,f14,f2,f3,f62,f184,f128,f136"
                 f"&req_trace={ts}&_={ts}"
             )
-            resp = self._get_with_backoff(url, headers={"Referer": "https://quote.eastmoney.com/"})
+            resp = self._get_with_backoff(url, headers={"Referer": "https://quote.eastmoney.com/"}, timeout=timeout, max_retries=max_retries)
             data = resp.json()
             diff = (data.get("data") or {}).get("diff") or []
             items = []
@@ -356,7 +366,16 @@ class CommunityEnhancedCollector(BaseCollector):
 
         elif data_type == "main_fund_rank":
             top_n = kwargs.get("top_n", 20)
-            items = self._fetch_main_fund_rank(top_n=top_n)
+            # pitfall 2026-07-29: 必须在 async handler 里包 to_thread,
+            # 否则 push2delay timeout + sync sleep 阻塞 aiohttp 事件循环,
+            # 引发 8084 hang (recv_q 累积到 478 = 死锁强证据)。
+            # 用 partial 固定 (timeout=5s, max_retries=1)，因为函数内部
+            # _get_with_backoff 默认 (timeout=10, max_retries=3) 太长，繁忙时段
+            # 会拖垮整个事件循环。partial 保留原 kwargs 兼容。
+            import functools
+            items = await asyncio.to_thread(
+                functools.partial(self._fetch_main_fund_rank, top_n=top_n)
+            )
             if items is None:
                 return CollectResult(
                     success=False, data=None, source="eastmoney_em",
@@ -380,7 +399,11 @@ class CommunityEnhancedCollector(BaseCollector):
         elif data_type == "sector_fund_flow":
             kind = kwargs.get("kind", "industry")
             top_n = kwargs.get("top_n", 15)
-            items = self._fetch_sector_fund_flow(kind=kind, top_n=top_n)
+            # pitfall 2026-07-29: 同 main_fund_rank，必须 asyncio.to_thread
+            import functools
+            items = await asyncio.to_thread(
+                functools.partial(self._fetch_sector_fund_flow, kind=kind, top_n=top_n)
+            )
             if items is None:
                 return CollectResult(
                     success=False, data=None, source="eastmoney_em",
