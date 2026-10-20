@@ -57,7 +57,7 @@ class AKShareFetcher(BaseCollector):
         start = now_tz()
         try:
             if data_type == "nav":
-                raw = self._fetch_fund_nav_sync(symbol)
+                raw = await asyncio.to_thread(self._fetch_fund_nav_sync, symbol)
                 if raw is None:
                     return CollectResult(False, None, "akshare", symbol, "nav", "基金净值数据不可用", (now_tz()-start).total_seconds())
                 normalized = self._normalize_nav(raw, symbol)
@@ -65,7 +65,7 @@ class AKShareFetcher(BaseCollector):
 
             elif data_type == "estimate_nav":
                 # 盘中估算净值（东方财富 fundgz 接口）
-                raw = self._fetch_fund_estimate_nav_sync(symbol)
+                raw = await asyncio.to_thread(self._fetch_fund_estimate_nav_sync, symbol)
                 if raw is None:
                     return CollectResult(False, None, "akshare", symbol, "estimate_nav", "盘中估算净值不可用（非交易日或接口失败）", (now_tz()-start).total_seconds())
                 normalized = {
@@ -83,7 +83,7 @@ class AKShareFetcher(BaseCollector):
                 return CollectResult(True, normalized, "fundgz", symbol, "estimate_nav", duration_seconds=(now_tz()-start).total_seconds())
             
             elif data_type == "news":
-                raw_list = self._fetch_stock_news_sync(symbol)
+                raw_list = await asyncio.to_thread(self._fetch_stock_news_sync, symbol)
                 if raw_list is None:
                     return CollectResult(False, None, "akshare", symbol, "news", "新闻数据不可用", (now_tz()-start).total_seconds())
                 normalized_list = [self._normalize_news(item, symbol) for item in raw_list]
@@ -99,7 +99,7 @@ class AKShareFetcher(BaseCollector):
 
             elif data_type == "fundamental":
                 # 使用同步的 fetch_fundamental（自动区分基金/股票）
-                raw = self.fetch_fundamental(symbol)
+                raw = await asyncio.to_thread(self.fetch_fundamental, symbol)
                 if raw is None:
                     source_hint = "雪球" if self._is_fund_symbol(symbol) else "腾讯"
                     return CollectResult(False, None, "akshare", symbol, "fundamental", f"基本面数据不可用（{source_hint}源失败）", (now_tz()-start).total_seconds())
@@ -111,7 +111,7 @@ class AKShareFetcher(BaseCollector):
             elif data_type == "index":
                 # 采集大盘/指数数据（使用腾讯新浪接口）
                 codes = kwargs.get('codes', ['sh000001', 'sh000300', 'sh000688', 'sz399001', 'sz399006'])
-                raw_list = self._fetch_index_data_sync(codes)
+                raw_list = await asyncio.to_thread(self._fetch_index_data_sync, codes)
                 if raw_list is None:
                     return CollectResult(False, None, "akshare", symbol or "*", "index", "指数数据不可用", (now_tz()-start).total_seconds())
                 normalized_list = [self._normalize_index(item) for item in raw_list]
@@ -119,7 +119,7 @@ class AKShareFetcher(BaseCollector):
 
             elif data_type == "announcement":
                 # 采集公告数据（巨潮资讯）
-                raw_list = self._fetch_announcement_cninfo(symbol)
+                raw_list = await asyncio.to_thread(self._fetch_announcement_cninfo, symbol)
                 if raw_list is None:
                     return CollectResult(False, None, "akshare", symbol, "announcement", "公告数据不可用", (now_tz()-start).total_seconds())
                 normalized_list = [self._normalize_announcement(item, symbol) for item in raw_list]
@@ -127,7 +127,7 @@ class AKShareFetcher(BaseCollector):
 
             elif data_type == "community":
                 # 采集社区/股吧数据（东方财富）
-                raw_list = self._fetch_community_guba(symbol)
+                raw_list = await asyncio.to_thread(self._fetch_community_guba, symbol)
                 if raw_list is None:
                     return CollectResult(False, None, "akshare", symbol, "community", "社区数据不可用", (now_tz()-start).total_seconds())
                 normalized_list = [self._normalize_community(item, symbol) for item in raw_list]
