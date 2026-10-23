@@ -135,7 +135,6 @@ class AKShareFetcher(BaseCollector):
 
             elif data_type == "minute":
                 # 采集分钟K线数据（当日所有分钟线）
-                import asyncio
                 loop = asyncio.get_event_loop()
                 bars = await loop.run_in_executor(None, self._fetch_minute_bars_sina, symbol, '1')
                 if bars is None:
