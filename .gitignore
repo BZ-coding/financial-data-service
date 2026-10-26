@@ -12,3 +12,16 @@ logs/
 .env
 .DS_Store
 market_data_service.tar.gz
+
+# 备份文件（各类 .bak-YYYYMMDD_HHMM 后缀）
+*.bak-*
+*.bak
+
+# 死掉的 venv 目录（如 venv.py312-dead-20261025，440M）
+venv.*-dead-*/
+
+# 旧版 requirements 存档副本（内容已在 requirements.txt 注释里说明）
+market_service/requirements.txt.legacy-*
+
+# 交易日历缓存（运行时生成，探针自动刷新）
+market_service/data/trade_calendar.json

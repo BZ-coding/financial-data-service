@@ -255,7 +255,8 @@ class ChainCollector:
         """对单个信源尝试采集，带超时"""
         # Phase 7 (2026-07-06): HKEX 单次 13-25s + SSL 慢, 15s 默认超时不够
         # 走 slow_sources 名单, 给更长 timeout
-        SLOW_SOURCES = {"hkex_enhanced"}
+        # tickflow 免费层首请求需从服务器拉全量历史日K，实测单次可超 15s
+        SLOW_SOURCES = {"hkex_enhanced", "tickflow"}
         timeout_sec = 60 if source in SLOW_SOURCES else 15
         try:
             async with asyncio.timeout(timeout_sec):

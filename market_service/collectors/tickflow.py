@@ -79,6 +79,24 @@ class TickFlowCollector(BaseCollector):
             prev_close = close
         return records
 
+    @staticmethod
+    def _tf_symbol(symbol: str) -> str:
+        """把内部港股代码转成 tickflow 的代码格式
+
+        本项目内部统一用 'hk03690' 格式（eastmoney 转 '116.03690'，
+        hkex_enhanced 剥掉 'hk' 前缀）。但 tickflow 免费层要求
+        '03690.HK' 格式，且只支持港股 —— 直接传 'hk03690' 会静默
+        返回空数据（不报错），表现为日志里刷 "TickFlow 无数据"。
+        """
+        if not symbol:
+            return symbol
+        s = symbol.strip()
+        low = s.lower()
+        # hk + 5 位数字 = 7 个字符（如 hk03690）
+        if low.startswith('hk') and len(low) == 7 and low[2:].isdigit():
+            return f"{low[2:]}.HK"
+        return s
+
     async def collect(
         self,
         symbol: str,
@@ -91,6 +109,7 @@ class TickFlowCollector(BaseCollector):
         内部已有缓存（避免同一进程重复请求）。
         """
         start = datetime.now(timezone(timedelta(hours=8)))
+        tf_symbol = self._tf_symbol(symbol)
 
         try:
             # tickflow 的 klines.get 是同步的，放到 executor
@@ -99,7 +118,7 @@ class TickFlowCollector(BaseCollector):
             def _fetch():
                 tf = self._get_tf()
                 # 拉最近30天，足够覆盖近期交易
-                df = tf.klines.get(symbol, period='1d', as_dataframe=True)
+                df = tf.klines.get(tf_symbol, period='1d', as_dataframe=True)
                 return df
 
             df = await loop.run_in_executor(None, _fetch)
@@ -126,6 +145,16 @@ class TickFlowCollector(BaseCollector):
                     error="TickFlow 数据标准化失败",
                     duration_seconds=(datetime.now(timezone(timedelta(hours=8))) - start).total_seconds(),
                 )
+
+            # tickflow 返回的是升序日K，但下游 chain._transform_price 取 raw[0]
+            # 作为"当前价格"，所以这里反转成最新在前，并补齐 price / trade_time
+            # 字段（日K只有 close / trade_date，没有 price / trade_time）。
+            records.reverse()
+            latest = records[0]
+            latest['price'] = latest.get('close')
+            latest['trade_time'] = f"{latest.get('trade_date')} 15:00:00" if latest.get('trade_date') else None
+            if latest.get('prev_close') is None and len(records) > 1:
+                latest['prev_close'] = records[1].get('close')
 
             duration = (datetime.now(timezone(timedelta(hours=8))) - start).total_seconds()
             return CollectResult(

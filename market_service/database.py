@@ -1417,11 +1417,13 @@ class Database:
             inc_te = 1 if is_transform_error else 0
 
             # 连续成功：成功时 +1，失败时清零
-            if success:
-                consec_expr = "COALESCE(consecutive_success, 0) + 1"
-            else:
-                consec_expr = "0"
-
+            #
+            # ⚠️ 2026-10-26 修复：原写法把 SQL 表达式当**参数**传（consecutive_success = ?），
+            #    SQLite 收到的是字符串字面量 'COALESCE(consecutive_success, 0) + 1'，
+            #    存进列里变成 TEXT（typeof=text），不是数字 → 任何基于"连续成功次数"的
+            #    降级/告警逻辑都会失效。
+            #    现在改成 DO UPDATE 里的**原生 SQL 表达式**，用 excluded.success 判断本次成败。
+            #    （excluded.success = 本次插入的 inc_success，1=成功 0=失败）
             self.conn.execute("""
                 INSERT INTO source_metrics
                 (source, data_type, total, success, failure, transform_error,
@@ -1435,7 +1437,11 @@ class Database:
                     avg_sec = (avg_sec * total + ?) / (total + 1),
                     success_rate = CAST(success + ? AS REAL) / (total + 1),
                     updated_at = ?,
-                    consecutive_success = ?
+                    consecutive_success = CASE
+                        WHEN excluded.success = 1
+                            THEN COALESCE(source_metrics.consecutive_success, 0) + 1
+                        ELSE 0
+                    END
             """, (
                 source, data_type, inc_total, inc_success, inc_failure, inc_te,
                 duration,
@@ -1447,7 +1453,6 @@ class Database:
                 duration,            # 移动平均的当前耗时
                 inc_success,         # 新增的成功数
                 now_tz().isoformat(),
-                consec_expr,         # SQL 表达式字符串 → 但参数化的是字面 0/1
             ))
             self.conn.commit()
             return True
