@@ -152,6 +152,47 @@ def is_trading_day(now=None):
     return now.weekday() < 5
 
 
+def selfcheck_trading_day(now=None):
+    """自检：与 check_trading_day.py 交叉验证交易日判断
+
+    为什么需要：探针自己加载日历缓存（data/trade_calendar.json），
+    而 Hermes 的 6 个 cron 用的是 ~/.hermes/scripts/check_trading_day.py。
+    两者数据源独立 —— **如果那个脚本挂了，探针察觉不到**。
+    所以每轮顺便跑一次它做交叉验证：
+      - 脚本执行失败（挂了/超时）→ WARN，自检失效要能发现
+      - 两者结论不一致 → WARN，日历不同步会让 cron 和探针各说各话
+    超时保护 20s：脚本缓存失效时会联网抓，实测曾 >120s，不能拖慢探针。
+    """
+    now = now or datetime.now(timezone(timedelta(hours=8)))
+    script = "/home/zsd/.hermes/scripts/check_trading_day.py"
+    if not os.path.exists(script):
+        log(f"  [自检] WARN: 找不到 {script}，无法交叉验证交易日判断")
+        return
+    try:
+        out = subprocess.run(
+            [sys.executable, script, "--date", now.strftime("%Y-%m-%d")],
+            capture_output=True, text=True, timeout=20,
+        ).stdout.strip()
+    except subprocess.TimeoutExpired:
+        log("  [自检] WARN: check_trading_day.py 执行超时(>20s)，自检失效")
+        return
+    except Exception as e:
+        log(f"  [自检] WARN: check_trading_day.py 执行异常: {e}")
+        return
+
+    if not out:
+        log("  [自检] WARN: check_trading_day.py 无输出（可能已挂），自检失效")
+        return
+
+    script_says_trading = out.startswith("TRADING_DAY")
+    i_say_trading = is_trading_day(now)
+    if script_says_trading != i_say_trading:
+        log(f"  [自检] WARN: 交易日判断不一致 —— 脚本={out} 探针="
+            f"{'TRADING_DAY' if i_say_trading else 'HOLIDAY'}（日历不同步）")
+    else:
+        log(f"  [自检] OK: 交易日判断一致 ({out})")
+
+
 def in_trading_hours(now=None):
     """是否处于 A 股交易时段（09:15-15:05，真实交易日）
 
@@ -265,6 +306,7 @@ def main():
     now = datetime.now(timezone(timedelta(hours=8)))
     log(f"--- 模式: {'干跑观察期(不推送)' if DRY_RUN else '推送模式'} ---")
     trading_day = is_trading_day(now)
+    selfcheck_trading_day(now)
     market_open = in_trading_hours(now)
     log(f"--- 交易日: {'是' if trading_day else '否'} | "
         f"交易时段内: {'是' if market_open else '否（非交易时段放宽行情类指标）'} ---")
