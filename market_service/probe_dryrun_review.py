@@ -33,7 +33,7 @@ NOW = datetime.now(CN_TZ)
 
 # 观察期起点（判据最后一次变更时刻 —— 判据变了，之前的观察不再作数）
 # 2026-10-26 22:27：加入按源分组失败率 + 重复错误率 + 已知暂停源识别
-START = datetime(2026, 10, 26, 22, 27, 0, tzinfo=CN_TZ)
+START = datetime(2026, 10, 26, 22, 42, 0, tzinfo=CN_TZ)  # 判据加入重复错误率后重置
 
 
 def in_trading_hours(dt):
