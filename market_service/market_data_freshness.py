@@ -22,13 +22,47 @@ from datetime import datetime, timedelta, timezone
 
 DB_PATH = "/home/zsd/financial-data-service/market_service/data/market.db"
 LOG_PATH = "/home/zsd/financial-data-service/logs/market-data-freshness.log"
-HERMES_BIN = "/home/zsd/.local/bin/hermes"
-FEISHU_TARGET = "feishu:oc_90857aaa9c3a4533fdc12c008ca14d00"
+# ── 推送目标：**只从环境变量读，代码里不硬编码** ──
+# 干跑观察期不提供 PROBE_FEISHU_TARGET → 目标为空 → **物理上无法推送**。
+# 这比"记得关掉 DRY_RUN 开关"可靠：开关被误改也只是多打一条日志，
+# 而目标为空时 notify() 直接返回，任何路径都发不出去。
+HERMES_BIN = os.environ.get("PROBE_HERMES_BIN", "/home/zsd/.local/bin/hermes")
+FEISHU_TARGET = os.environ.get("PROBE_FEISHU_TARGET", "")
 
 # —— 阈值（偏宽松，优先不误报）——
 ACTIVE_SOURCE_MAX_STALE_MIN = 180   # 活跃源最近成功超过 3 小时 → 异常
 FAIL_RATE_WINDOW_MIN = 60            # 失败率统计窗口 1 小时
-FAIL_RATE_THRESHOLD = 0.85          # 失败率 > 85% → 异常
+FAIL_RATE_THRESHOLD = 0.85          # 全局失败率 > 85% → 异常（保留参考）
+
+# ---- 指标 2b：按 source 分组的失败率（2026-10-26 评审盲点 1）----
+# 原指标 2 是**全源混合**，被成功的大头稀释：实测"总计 107 条, 失败 1 条, 失败率 0.9%"
+# 而 eastmoney_em 那个小时是 3 次全失败 —— 混合后完全看不见。
+# 改为每个源单独算：样本 >= MIN_SAMPLES 才判（样本太少不判，避免小源噪声），
+# 且成功率 < 1-SUCCESS_RATE_THRESHOLD 才算异常。
+PER_SOURCE_MIN_SAMPLES = 20        # 每源最小样本数，低于此不判
+PER_SOURCE_SUCCESS_RATE_THRESHOLD = 0.80   # 成功率 < 80% → 异常
+# ⚠️ 分组失败率必须用**长窗口**：低频源每小时只采 1~4 次
+#    （实测 eastmoney_em 24h 共 96 条 ≈ 4 条/小时），
+#    1 小时窗口下样本永远 < 20 → 判据形同虚设。
+PER_SOURCE_WINDOW_MIN = 1440       # 24 小时
+REPEAT_ERROR_WINDOW_MIN = 1440      # 24 小时（重复错误需要时间累积）
+
+# ---- 指标 5：重复错误率（2026-10-26 评审盲点 3，静默失败最有效的特征签名）----
+# 同一 (source, data_type) 的失败 error_message 高度重复
+# → 说明接口**稳定返回无效内容**，不是网络抖动。
+# 实测：estimate_nav 504 次错误一字不差(100% 重复)、eastmoney_em 31/31、xueqiu 16/16
+#      —— 一次就能全部抓出来。
+REPEAT_ERROR_MIN_COUNT = 8          # 同一错误至少出现这么多次才判
+REPEAT_ERROR_MIN_RATIO = 0.7        # 重复占比 >= 70% 才判（错误高度雷同）
+
+# ---- 已知暂停的源（2026-10-26 Chief 拍板停用 xueqiu_hot 订阅）----
+# 根因：阿里云 WAF 的 JS 挑战（302 跳 g.alicdn.com/.../antidom.js），
+#       首页能 200 但不下发 xq_a_token，curl/requests 全部绕不过。
+# 处理：**不告警**（否则变成常态噪声），但**保留可追溯性**（日志里显式列出）。
+# 将来若要恢复，优先级：① 浏览器 Cookie  ② playwright（已在 venv 与 ~/.cache 中）
+KNOWN_PAUSED_SOURCES = {
+    "xueqiu": "阿里云 WAF JS 挑战，2026-10-26 经 Chief 拍板暂停订阅（Hermes 实际不消费该源）",
+}
 ROW_GROWTH_WINDOW_MIN = 60          # 行数增量统计窗口 1 小时
 MIN_ROW_GROWTH = 1                   # 1 小时内至少应新增 1 行
 
@@ -176,8 +210,27 @@ def log(msg):
     print(line)
 
 
+# 干跑观察期开关（评审纪律：上线前先只记录不推送）
+#   PROBE_DRY_RUN=1 → 只记录判定与依据，不推飞书
+#   观察满「1 个完整交易日 + 1 个非交易日 + 1 次凌晨非交易时段」且零误报后，
+#   由 probe_dryrun_review.py 复核并切换为推送模式。
+DRY_RUN = os.environ.get("PROBE_DRY_RUN", "1") not in ("0", "", "false", "False")
+
+
 def notify(msg):
-    """飞书告警（降权到 zsd：hermes 会检查自身目录属主）"""
+    """飞书告警（降权到 zsd：hermes 会检查自身目录属主）
+
+    **干跑期物理上发不出去**（两道独立的锁）：
+      1. DRY_RUN 为真 → 只记日志，直接返回
+      2. FEISHU_TARGET 为空（干跑期不提供该环境变量）→ 直接返回
+    即使有人误改了 DRY_RUN，第 2 道锁仍然拦住 —— 不依赖"记得关开关"。
+    """
+    if DRY_RUN:
+        log(f"[DRY-RUN] 本应推送的告警（干跑观察期，未实际发送）:\n{msg}")
+        return
+    if not FEISHU_TARGET:
+        log("[DRY-RUN] 未配置 PROBE_FEISHU_TARGET，推送目标为空，物理上无法发送（干跑观察期）")
+        return
     if not os.access(HERMES_BIN, os.X_OK):
         log(f"告警发送失败：{HERMES_BIN} 不可执行")
         return
@@ -210,6 +263,7 @@ def parse_ts(s):
 def main():
     problems = []
     now = datetime.now(timezone(timedelta(hours=8)))
+    log(f"--- 模式: {'干跑观察期(不推送)' if DRY_RUN else '推送模式'} ---")
     trading_day = is_trading_day(now)
     market_open = in_trading_hours(now)
     log(f"--- 交易日: {'是' if trading_day else '否'} | "
@@ -282,7 +336,7 @@ def main():
                         f"（超过 {ACTIVE_SOURCE_MAX_STALE_MIN} 分钟阈值）")
             log(f"  [{mark}] {src}: 最近成功 {last}（{age_min:.0f} 分钟前）")
 
-        # ---- 指标 2：近 1 小时失败率 ----
+        # ---- 指标 2：近 1 小时失败率（全局，仅参考） ----
         w = (now - timedelta(minutes=FAIL_RATE_WINDOW_MIN)).strftime("%Y-%m-%d %H:%M:%S")
         cur.execute("""
             SELECT status, COUNT(*) FROM collection_log
@@ -293,11 +347,83 @@ def main():
         total = sum(counts.values())
         fails = counts.get("failed", 0)
         rate = (fails / total) if total else 0
-        log(f"--- 近{FAIL_RATE_WINDOW_MIN}分钟: 总计 {total} 条, 失败 {fails} 条, 失败率 {rate:.1%} ---")
+        log(f"--- 近{FAIL_RATE_WINDOW_MIN}分钟(全局参考): 总计 {total} 条, 失败 {fails} 条, 失败率 {rate:.1%} ---")
         if total >= 5 and rate > FAIL_RATE_THRESHOLD:
             problems.append(
                 f"近 {FAIL_RATE_WINDOW_MIN} 分钟采集失败率 {rate:.1%}"
                 f"（{fails}/{total}），超过 {FAIL_RATE_THRESHOLD:.0%} 阈值")
+
+        # ---- 指标 2b：按 source 分组的失败率（评审盲点 1：全局混合会被稀释）----
+        # 全局失败率被成功的大头稀释：eastmoney_em 某小时 3 次全失败，
+        # 混进 107 条里就变成 0.9%，完全看不见。必须按源单独算。
+        # 用 24h 窗口：低频源每小时仅 1~4 条，1h 窗口样本永远不够。
+        ws = (now - timedelta(minutes=PER_SOURCE_WINDOW_MIN)).strftime("%Y-%m-%d %H:%M:%S")
+        cur.execute("""
+            SELECT source,
+                   SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS f,
+                   COUNT(*) AS t
+            FROM collection_log
+            WHERE started_at >= ? AND source != 'chain'
+            GROUP BY source
+        """, (ws,))
+        log(f"--- 近{PER_SOURCE_WINDOW_MIN}分钟 按源分组 ---")
+        for src, f_cnt, t_cnt in cur.fetchall():
+            f_cnt = f_cnt or 0
+            t_cnt = t_cnt or 0
+            if t_cnt < PER_SOURCE_MIN_SAMPLES:
+                log(f"  [样本不足] {src}: {f_cnt}/{t_cnt}（样本<{PER_SOURCE_MIN_SAMPLES}，不判）")
+                continue
+            succ_rate = 1 - (f_cnt / t_cnt)
+            if src in KNOWN_PAUSED_SOURCES:
+                log(f"  [已知暂停] {src}: {f_cnt}/{t_cnt} 失败 —— {KNOWN_PAUSED_SOURCES[src]}")
+                continue
+            if succ_rate < PER_SOURCE_SUCCESS_RATE_THRESHOLD:
+                log(f"  [FAIL] {src}: 成功率 {succ_rate:.1%}（{f_cnt}/{t_cnt} 失败）")
+                problems.append(
+                    f"源 {src} 近 {PER_SOURCE_WINDOW_MIN} 分钟成功率 {succ_rate:.1%}"
+                    f"（{f_cnt}/{t_cnt} 失败），低于 {PER_SOURCE_SUCCESS_RATE_THRESHOLD:.0%} 阈值")
+            else:
+                log(f"  [OK] {src}: 成功率 {succ_rate:.1%}（{f_cnt}/{t_cnt} 失败）")
+
+        # ---- 指标 5：重复错误率（评审盲点 3：静默失败最有效的特征签名）----
+        # 同一 (source, data_type) 的失败 error_message 高度重复
+        # → 接口**稳定返回无效内容**，不是网络抖动。
+        # 实测：estimate_nav 504 次一字不差、eastmoney_em 31/31、xueqiu 16/16
+        wr = (now - timedelta(minutes=REPEAT_ERROR_WINDOW_MIN)).strftime("%Y-%m-%d %H:%M:%S")
+        # ⚠️ 这里**包含 chain**：chain 是降级链，chain/estimate_nav 重复失败
+        #    表示"该 data_type 的整条链路全挂"，是最重要的信号之一。
+        cur.execute("""
+            SELECT source, data_type, error_message, COUNT(*) AS n
+            FROM collection_log
+            WHERE started_at >= ? AND status='failed'
+              AND error_message IS NOT NULL AND error_message != ''
+            GROUP BY source, data_type, error_message
+            HAVING n >= ?
+            ORDER BY n DESC
+        """, (wr, REPEAT_ERROR_MIN_COUNT))
+        repeat_rows = cur.fetchall()
+        if repeat_rows:
+            log(f"--- 重复错误（近{REPEAT_ERROR_WINDOW_MIN}分钟，同一错误出现>={REPEAT_ERROR_MIN_COUNT}次）---")
+            for src, dt, err_msg, n in repeat_rows:
+                cur.execute("""
+                    SELECT COUNT(*) FROM collection_log
+                    WHERE started_at >= ? AND status='failed' AND source=? AND data_type=?
+                """, (wr, src, dt))
+                tot_f = cur.fetchone()[0] or 0
+                ratio = (n / tot_f) if tot_f else 0
+                if ratio < REPEAT_ERROR_MIN_RATIO:
+                    continue
+                if src in KNOWN_PAUSED_SOURCES:
+                    log(f"  [已知暂停] {src}/{dt}: 重复 {n}/{tot_f} 次 —— {KNOWN_PAUSED_SOURCES[src]}")
+                    continue
+                short = (err_msg or "")[:80]
+                log(f"  [REPEAT] {src}/{dt}: 同一错误 {n}/{tot_f} 次（{ratio:.0%} 重复）")
+                problems.append(
+                    f"源 {src}/{dt} 近 {REPEAT_ERROR_WINDOW_MIN} 分钟出现**高度重复的同一错误** "
+                    f"{n}/{tot_f} 次（{ratio:.0%}）→ 接口稳定返回无效内容，非网络抖动。"
+                    f"错误摘要: {short}")
+        else:
+            log(f"--- 重复错误: 无（近{REPEAT_ERROR_WINDOW_MIN}分钟无同一错误出现>={REPEAT_ERROR_MIN_COUNT}次）---")
 
         # ---- 指标 3：核心表行数增量 ----
         # ⚠️ news_data 不用行数判存活（UNIQUE 去重 → 采集成功但行数不涨是常态），
