@@ -250,6 +250,53 @@ def selfcheck_trading_day(now=None):
         log(f"  [自检] OK: 交易日判断一致 ({out})")
 
 
+def selfcheck_exceptions(now=None):
+    """自检：豁免登记表本身不能"过度豁免"
+
+    为什么需要（与 selfcheck_trading_day 同一思路）：
+    豁免机制是有可能**写坏的** —— 比如把所有源都登记进去、或把 time_windowed
+    的判断写反。后果是探针**永远报"全部指标正常"**，而探针其实已经瞎了，
+    没人会发现（这正是"静默跳过伪装成正常"）。
+
+    自检三点：
+      1. 登记表规模异常（过多/为空）→ WARN
+      2. time_windowed 类若在**交易时段内**仍被豁免 → WARN（判断可能反了）
+      3. paused_by_decision 类若最近有成功采集 → WARN（登记可能过期，该恢复告警了）
+    """
+    now = now or datetime.now(timezone(timedelta(hours=8)))
+    srcs = KNOWN_SOURCE_EXCEPTIONS
+    if not srcs:
+        log("  [自检] WARN: 豁免登记表为空 —— 若这不是预期的，说明登记表被清空了")
+        return
+    if len(srcs) > 20:
+        log(f"  [自检] WARN: 豁免登记表有 {len(srcs)} 条，异常多 —— "
+            f"过度豁免会让探针失去检测能力")
+
+    in_hours = in_trading_hours(now)
+    for key, ex in srcs.items():
+        kind = ex["kind"]
+        label = key if isinstance(key, str) else f"{key[0]}/{key[1]}"
+        # 1) time_windowed 不该在交易时段豁免
+        if kind == "time_windowed" and in_hours:
+            log(f"  [自检] WARN: {label} 是 time_windowed，但当前处于交易时段 —— "
+                f"此时它的失败应照常告警，请确认豁免判断没有写反")
+        # 2) paused_by_decision 若最近有成功采集，登记可能过期
+        if kind == "paused_by_decision" and isinstance(key, str):
+            try:
+                con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=10)
+                last = con.execute(
+                    "SELECT MAX(started_at) FROM collection_log "
+                    "WHERE source=? AND status='success'", (key,)).fetchone()[0]
+                con.close()
+                if last:
+                    log(f"  [自检] INFO: {label} 标记为人为暂停，但最近有成功采集"
+                        f"（{last}）—— 若已恢复，可考虑撤销该登记")
+            except Exception:
+                pass
+    log(f"  [自检] 豁免登记表 {len(srcs)} 条，类型分布: "
+        f"{ {k: sum(1 for v in srcs.values() if v['kind']==k) for k in ('paused_by_decision','time_windowed','fixed_watching')} }")
+
+
 def exception_applies(src, kind, event_ts=None, now=None, data_type=None):
     """判断某条异常是否落在"已知受限源"的豁免范围内
 
@@ -421,6 +468,7 @@ def main():
     log(f"--- 模式: {'干跑观察期(不推送)' if DRY_RUN else '推送模式'} ---")
     trading_day = is_trading_day(now)
     selfcheck_trading_day(now)
+    selfcheck_exceptions(now)
     market_open = in_trading_hours(now)
     log(f"--- 交易日: {'是' if trading_day else '否'} | "
         f"交易时段内: {'是' if market_open else '否（非交易时段放宽行情类指标）'} ---")
