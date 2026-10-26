@@ -1,0 +1,12 @@
+[Unit]
+Description=8084 行情数据新鲜度探针 timer（每 30 分钟）
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+# 错开整点，避免和 watchdog / 采集周期撞在同一秒
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
