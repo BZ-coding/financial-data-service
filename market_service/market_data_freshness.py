@@ -60,8 +60,65 @@ REPEAT_ERROR_MIN_RATIO = 0.7        # 重复占比 >= 70% 才判（错误高度�
 #       首页能 200 但不下发 xq_a_token，curl/requests 全部绕不过。
 # 处理：**不告警**（否则变成常态噪声），但**保留可追溯性**（日志里显式列出）。
 # 将来若要恢复，优先级：① 浏览器 Cookie  ② playwright（已在 venv 与 ~/.cache 中）
+# ── 已知受限源登记表 ─────────────────────────────────────────────
+# ⚠️ 这不是"硬编码忽略"。每条豁免都必须登记 **原因 + 生效时间 + 复核方式**，
+#    且豁免行为本身会写进日志 —— 这样"人工豁免"是**可审计**的，不等于悄悄放过。
+#
+# 三类，语义完全不同，绝不能混为一谈：
+#
+#   paused_by_decision（人为暂停）
+#     源被人为停用（Chief 拍板）。不告警，但日志明确标 [已知暂停] 保留可追溯性。
+#     无限期，需人工复核后才恢复。
+#
+#   time_windowed（时段受限）
+#     源只在交易时段有意义（收盘后数据源主动断连是正常的）。
+#     **交易时段内的失败仍然告警** —— 只有非交易时段才豁免。
+#     随窗口滚动自动恢复正常，无需人工。
+#
+#   fixed_watching（已修复，观察中）
+#     源已修复，但统计窗口里还含修复前的历史失败。
+#     **只豁免生效时间点之前的失败**，之后的失败照常告警。
+#     随窗口滚动自动恢复正常。
+#
+# 字段：kind / reason / since（豁免的起始时间戳）/ review（复核方式）
+KNOWN_SOURCE_EXCEPTIONS = {
+    "xueqiu": {
+        "kind": "paused_by_decision",
+        "reason": "阿里云 WAF JS 挑战（302 跳 antidom.js），"
+                  "2026-10-26 经 Chief 拍板暂停订阅；Hermes 实际不消费该源",
+        "since": None,          # 无限期，人工复核
+        "review": "需要时用浏览器 Cookie 恢复（优先级①）或 playwright（②），"
+                  "见 8084采集健康现状.md §7.0.3c",
+    },
+    "eastmoney_em": {
+        "kind": "time_windowed",
+        "reason": "东财在收盘后(15:00+)对本机出口 IP 主动断连；"
+                  "资金流是日内数据，收盘后不采集是正确的",
+        "since": None,          # 由交易时段判定，非固定时间点
+        "review": "随统计窗口滚动自动恢复正常；"
+                  "交易时段内的失败仍会告警（那才是真故障）",
+    },
+    ("chain", "estimate_nav"): {
+        "kind": "fixed_watching",
+        "reason": "东财 fundgz 估值接口已下线，2026-10-26 22:22 换新浪源；"
+                  "24h 统计窗口内仍含换源前的历史失败（失败记录的 source 是聚合链 chain，"
+                  "真实数据类型在 data_type）",
+        "since": 1792990940.0,  # 2026-10-26 22:22 换源生效时刻
+        "review": "随统计窗口滚动自动恢复正常；换源后的失败照常告警",
+    },
+    "estimate_nav": {
+        "kind": "fixed_watching",
+        "reason": "东财 fundgz 估值接口已下线，2026-10-26 22:22 换新浪源；"
+                  "24h 统计窗口内仍含换源前的历史失败",
+        "since": 1792990940.0,  # 2026-10-26 22:22 换源生效时刻
+        "review": "随统计窗口滚动自动恢复正常；换源后的失败照常告警",
+    },
+}
+
+# 兼容旧名（保留以便其它脚本/文档引用）
 KNOWN_PAUSED_SOURCES = {
-    "xueqiu": "阿里云 WAF JS 挑战，2026-10-26 经 Chief 拍板暂停订阅（Hermes 实际不消费该源）",
+    k: v["reason"] for k, v in KNOWN_SOURCE_EXCEPTIONS.items()
+    if v["kind"] == "paused_by_decision" and isinstance(k, str)
 }
 ROW_GROWTH_WINDOW_MIN = 60          # 行数增量统计窗口 1 小时
 MIN_ROW_GROWTH = 1                   # 1 小时内至少应新增 1 行
@@ -191,6 +248,63 @@ def selfcheck_trading_day(now=None):
             f"{'TRADING_DAY' if i_say_trading else 'HOLIDAY'}（日历不同步）")
     else:
         log(f"  [自检] OK: 交易日判断一致 ({out})")
+
+
+def exception_applies(src, kind, event_ts=None, now=None, data_type=None):
+    """判断某条异常是否落在"已知受限源"的豁免范围内
+
+    返回 (是否豁免, 说明文字)。**豁免必须可审计** —— 说明文字会写进日志。
+
+    三类语义：
+      paused_by_decision → 始终豁免（人为暂停，需人工复核）
+      time_windowed    → 仅在**非交易时段**豁免（交易时段内失败是真故障）
+      fixed_watching   → 仅豁免 since 之前的事件（换源后的失败照常告警）
+    """
+    now = now or datetime.now(timezone(timedelta(hours=8)))
+    # 先按 (source, data_type) 精确匹配，再退回按 source 匹配
+    # （聚合链的失败记录 source='chain'，真正的数据类型在 data_type 上）
+    ex = KNOWN_SOURCE_EXCEPTIONS.get((src, data_type)) if data_type else None
+    if ex is None:
+        ex = KNOWN_SOURCE_EXCEPTIONS.get(src)
+    if not ex:
+        return False, ""
+    k = ex["kind"]
+    if k == "paused_by_decision":
+        return True, f"[已知暂停] {ex['reason']}｜复核方式: {ex['review']}"
+    if k == "time_windowed":
+        # 交易时段内的失败是真故障，不豁免
+        if in_trading_hours(now):
+            return False, ""
+        return True, (f"[已知时段受限] {ex['reason']}｜"
+                      f"复核方式: {ex['review']}")
+    if k == "fixed_watching":
+        since = ex.get("since")
+        # event_ts 可能是字符串（collection_log.started_at 是文本时间戳）
+        if isinstance(event_ts, str):
+            try:
+                event_ts = datetime.strptime(event_ts[:19], "%Y-%m-%d %H:%M:%S").replace(
+                    tzinfo=timezone(timedelta(hours=8))).timestamp()
+            except ValueError:
+                event_ts = None
+        if since is not None and event_ts is not None and event_ts < since:
+            return True, (f"[已知已修复·观察中] {ex['reason']}｜"
+                          f"复核方式: {ex['review']}")
+        # 事件在修复之后 → 不豁免（照常告警）
+        return False, ""
+    return False, ""
+
+
+def source_window_start(src, data_type, default_since_ts, now=None):
+    """确定某个源的统计窗口起点
+
+    - fixed_watching 类（已修复观察中）：用 since（换源生效时刻）作为起点
+      → 只统计修复后的数据，历史失败不影响判据
+    - 其它：用统一的默认窗口
+    """
+    ex = KNOWN_SOURCE_EXCEPTIONS.get((src, data_type)) or KNOWN_SOURCE_EXCEPTIONS.get(src)
+    if ex and ex["kind"] == "fixed_watching" and ex.get("since"):
+        return ex["since"]
+    return default_since_ts
 
 
 def in_trading_hours(now=None):
@@ -416,9 +530,14 @@ def main():
                 log(f"  [样本不足] {src}: {f_cnt}/{t_cnt}（样本<{PER_SOURCE_MIN_SAMPLES}，不判）")
                 continue
             succ_rate = 1 - (f_cnt / t_cnt)
-            if src in KNOWN_PAUSED_SOURCES:
-                log(f"  [已知暂停] {src}: {f_cnt}/{t_cnt} 失败 —— {KNOWN_PAUSED_SOURCES[src]}")
+            # 已知受限源：按类别判断是否豁免（时段受限在交易时段内不豁免）
+            exempt, note = exception_applies(src, "per_source_failure_rate", now=now)
+            if exempt:
+                log(f"  {note} —— 本窗口 {f_cnt}/{t_cnt} 失败（豁免，不计告警）")
                 continue
+            if src in KNOWN_SOURCE_EXCEPTIONS:
+                log(f"  [已知受限源·本次不豁免] {src}: {f_cnt}/{t_cnt} 失败 "
+                    f"({KNOWN_SOURCE_EXCEPTIONS[src]['kind']})")
             if succ_rate < PER_SOURCE_SUCCESS_RATE_THRESHOLD:
                 log(f"  [FAIL] {src}: 成功率 {succ_rate:.1%}（{f_cnt}/{t_cnt} 失败）")
                 problems.append(
@@ -435,7 +554,8 @@ def main():
         # ⚠️ 这里**包含 chain**：chain 是降级链，chain/estimate_nav 重复失败
         #    表示"该 data_type 的整条链路全挂"，是最重要的信号之一。
         cur.execute("""
-            SELECT source, data_type, error_message, COUNT(*) AS n
+            SELECT source, data_type, error_message, COUNT(*) AS n,
+                   MIN(started_at) AS first_at, MAX(started_at) AS last_at
             FROM collection_log
             WHERE started_at >= ? AND status='failed'
               AND error_message IS NOT NULL AND error_message != ''
@@ -446,7 +566,7 @@ def main():
         repeat_rows = cur.fetchall()
         if repeat_rows:
             log(f"--- 重复错误（近{REPEAT_ERROR_WINDOW_MIN}分钟，同一错误出现>={REPEAT_ERROR_MIN_COUNT}次）---")
-            for src, dt, err_msg, n in repeat_rows:
+            for src, dt, err_msg, n, first_at, last_at in repeat_rows:
                 cur.execute("""
                     SELECT COUNT(*) FROM collection_log
                     WHERE started_at >= ? AND status='failed' AND source=? AND data_type=?
@@ -455,9 +575,42 @@ def main():
                 ratio = (n / tot_f) if tot_f else 0
                 if ratio < REPEAT_ERROR_MIN_RATIO:
                     continue
-                if src in KNOWN_PAUSED_SOURCES:
-                    log(f"  [已知暂停] {src}/{dt}: 重复 {n}/{tot_f} 次 —— {KNOWN_PAUSED_SOURCES[src]}")
+                # fixed_watching（已修复）：只统计修复生效之后的失败，
+                # 修复前的历史失败不参与判据（随窗口自然消失）
+                ex = KNOWN_SOURCE_EXCEPTIONS.get((src, dt)) or KNOWN_SOURCE_EXCEPTIONS.get(src)
+                if ex and ex["kind"] == "fixed_watching" and ex.get("since"):
+                    since_ts = ex["since"]
+                    cur.execute("""
+                        SELECT COUNT(*) FROM collection_log
+                        WHERE started_at >= ? AND status='failed'
+                          AND source=? AND data_type=?
+                          AND error_message IS NOT NULL AND error_message != ''
+                    """, (since_ts, src, dt))
+                    tot_after = cur.fetchone()[0] or 0
+                    cur.execute("""
+                        SELECT COUNT(*) FROM collection_log
+                        WHERE started_at >= ? AND status='failed'
+                          AND source=? AND data_type=?
+                          AND error_message IS NOT NULL AND error_message != ''
+                    """, (since_ts, src, dt))
+                    n_after = cur.fetchone()[0] or 0
+                    if n_after < REPEAT_ERROR_MIN_COUNT:
+                        log(f"  [已修复·观察中] {src}/{dt}: 换源后同类错误 {n_after} 次"
+                            f"（<{REPEAT_ERROR_MIN_COUNT}，历史 {n} 次已随窗口滚出）→ 不告警")
+                        continue
+                    n, tot_f = n_after, tot_after
+                    ratio = (n / tot_f) if tot_f else 0
+                    if ratio < REPEAT_ERROR_MIN_RATIO:
+                        continue
+                # 已知受限源：按类别判断（已修复只豁免换源前的事件）
+                exempt, note = exception_applies(src, "repeat_error_rate",
+                                                event_ts=wr, now=now, data_type=dt)
+                if exempt:
+                    log(f"  {note} —— {src}/{dt} 重复 {n}/{tot_f} 次（豁免，不计告警）")
                     continue
+                if src in KNOWN_SOURCE_EXCEPTIONS:
+                    log(f"  [已知受限源·本次不豁免] {src}/{dt}: 重复 {n}/{tot_f} 次 "
+                        f"({KNOWN_SOURCE_EXCEPTIONS[src]['kind']})")
                 short = (err_msg or "")[:80]
                 log(f"  [REPEAT] {src}/{dt}: 同一错误 {n}/{tot_f} 次（{ratio:.0%} 重复）")
                 problems.append(
