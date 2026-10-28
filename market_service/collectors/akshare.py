@@ -34,9 +34,25 @@ class CollectResult:
 from .base import BaseCollector
 
 class AKShareFetcher(BaseCollector):
-    def __init__(self, rate_limit_per_minute: int = 30):
+    # estimate_nav 信源顺序（可由 config.yaml 的 collectors.akshare.estimate_nav_sources 覆盖）
+    #   sina_fu : 新浪 fu_ 行情 —— 盘中估算净值
+    #   sina_of : 新浪 of_ 行情 —— 确认收盘净值（债券基金等 fu_ 无数据时兜底）
+    #   fundgz  : 东方财富 fundgz —— 2026-10-26 起已下线（返回 404 页但 HTTP 200），保留以便切回
+    DEFAULT_ESTIMATE_NAV_SOURCES = ["sina_fu", "sina_of", "fundgz"]
+
+    # 新浪行情接口需要的请求头（hq.sinajs.cn 对 Referer 敏感）
+    SINA_HEADERS = {
+        "Referer": "https://finance.sina.com.cn/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+
+    def __init__(self, rate_limit_per_minute: int = 30,
+                 estimate_nav_sources: Optional[List[str]] = None):
         BaseCollector.__init__(self, rate_limit_per_minute)
         self.logger = logging.getLogger(__name__)
+        self.estimate_nav_sources = list(
+            estimate_nav_sources or self.DEFAULT_ESTIMATE_NAV_SOURCES
+        )
     
 
     def _get_with_backoff(self, url: str, headers: Optional[Dict] = None, timeout: int = 10) -> str:
@@ -64,23 +80,52 @@ class AKShareFetcher(BaseCollector):
                 return CollectResult(True, normalized, "akshare", symbol, "nav", duration_seconds=(now_tz()-start).total_seconds())
 
             elif data_type == "estimate_nav":
-                # 盘中估算净值（东方财富 fundgz 接口）
-                raw = await asyncio.to_thread(self._fetch_fund_estimate_nav_sync, symbol)
-                if raw is None:
-                    return CollectResult(False, None, "akshare", symbol, "estimate_nav", "盘中估算净值不可用（非交易日或接口失败）", (now_tz()-start).total_seconds())
-                normalized = {
-                    "source": "fundgz",
-                    "symbol": symbol,
-                    "data_type": "estimate_nav",
-                    "fund_name": raw.get('fund_name'),
-                    "nav_date": raw.get('nav_date'),
-                    "dwjz": raw.get('dwjz'),
-                    "estimate_nav": raw.get('estimate_nav'),
-                    "estimate_growth": raw.get('estimate_growth'),
-                    "estimate_time": raw.get('estimate_time'),
-                    "raw": raw,
-                }
-                return CollectResult(True, normalized, "fundgz", symbol, "estimate_nav", duration_seconds=(now_tz()-start).total_seconds())
+                # 盘中估算净值 —— 按 config 的信源顺序尝试（2026-10-26：东财 fundgz 已下线）
+                last_err = ""
+                for src_name in self.estimate_nav_sources:
+                    try:
+                        if src_name == "sina_fu":
+                            raw = await asyncio.to_thread(self._fetch_estimate_nav_sina_fu_sync, symbol)
+                        elif src_name == "sina_of":
+                            raw = await asyncio.to_thread(self._fetch_estimate_nav_sina_of_sync, symbol)
+                        elif src_name == "fundgz":
+                            raw = await asyncio.to_thread(self._fetch_fund_estimate_nav_sync, symbol)
+                        else:
+                            last_err = f"未知 estimate_nav 信源: {src_name}"
+                            continue
+                    except Exception as e:
+                        last_err = f"[{src_name}] 异常: {type(e).__name__}: {e}"
+                        self.logger.warning(f"estimate_nav {symbol} [{src_name}] 异常: {e}")
+                        continue
+
+                    if raw is None:
+                        last_err = last_err or f"[{src_name}] 无数据"
+                        continue
+
+                    normalized = {
+                        "source": src_name,
+                        "symbol": symbol,
+                        "data_type": "estimate_nav",
+                        "fund_name": raw.get('fund_name'),
+                        "nav_date": raw.get('nav_date'),
+                        "dwjz": raw.get('dwjz'),
+                        "estimate_nav": raw.get('estimate_nav'),
+                        "estimate_growth": raw.get('estimate_growth'),
+                        "estimate_time": raw.get('estimate_time'),
+                        "semantic": raw.get('semantic'),
+                        "raw": raw,
+                    }
+                    self.logger.info(
+                        f"estimate_nav {symbol} <- {src_name} "
+                        f"(semantic={raw.get('semantic')}, 值={raw.get('estimate_nav')})"
+                    )
+                    return CollectResult(True, normalized, src_name, symbol, "estimate_nav",
+                                         duration_seconds=(now_tz()-start).total_seconds())
+
+                return CollectResult(
+                    False, None, "akshare", symbol, "estimate_nav",
+                    f"盘中估算净值不可用（所有信源失败: {last_err}）",
+                    (now_tz()-start).total_seconds())
             
             elif data_type == "news":
                 raw_list = await asyncio.to_thread(self._fetch_stock_news_sync, symbol)
@@ -240,6 +285,98 @@ class AKShareFetcher(BaseCollector):
             }
         except Exception as e:
             self.logger.warning(f"_fetch_fund_estimate_nav({symbol})异常: {e}")
+            return None
+
+    # ---------- 新浪行情系（2026-10-26 新增，东财 fundgz 下线后的替代源）----------
+    #
+    # 数据正确性已交叉验证（2026-10-26）：
+    #   sina_fu 的 fields[3]（昨日确认净值）与本库 nav_data 的 nav **6/6 完全一致**
+    #   （008114=1.6505 / 018824=1.2777 / 024450=1.5039 / 270023=5.5897 /
+    #     023895=1.4497 / 163807=1.1739）
+    #   sina_of 的 fields[4]（涨跌幅）与本库 nav_data 的 change_pct 一致
+    # 参考：Hermes 的 ~/.hermes/scripts/fund_quote_fallback.py 用的是同一套接口与解析。
+
+    def _sina_quote(self, prefix: str, symbol: str) -> Optional[List[str]]:
+        """拉新浪 hq.sinajs.cn 行情并拆成字段列表（GBK 解码）。
+
+        Returns None 表示无数据（该代码在新浪没有该类行情，例如债券基金的 fu_）。
+        """
+        import re, requests as _requests
+        url = f'http://hq.sinajs.cn/list={prefix}{symbol}'
+        try:
+            resp = _requests.get(url, headers=self.SINA_HEADERS, timeout=10)
+            resp.encoding = 'gbk'
+            text = resp.text
+            m = re.search(rf'var\s+hq_str_{re.escape(prefix)}{re.escape(symbol)}="([^"]*)"', text)
+            if not m:
+                self.logger.warning(f"_sina_quote({prefix}{symbol})响应无法解析: {text[:120]}")
+                return None
+            content = m.group(1)
+            if not content:
+                return None
+            return content.split(",")
+        except Exception as e:
+            self.logger.warning(f"_sina_quote({prefix}{symbol})异常: {e}")
+            return None
+
+    def _fetch_estimate_nav_sina_fu_sync(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """新浪 fu_ 行情 —— 盘中估算净值
+
+        响应格式（实测）：
+          var hq_str_fu_008114="天弘中证红利低波动100ETF联接A,10:58:00,1.6663,1.6505,
+                                1.7534,-0.036,0.9571,2026-10-26,1.6657,0.9216";
+          [0]=名称 [1]=时间 [2]=估算净值 [3]=昨日单位净值 [4]=? [5]=?
+          [6]=估算涨跌幅% [7]=日期 [8]=? [9]=?
+        """
+        f = self._sina_quote("fu_", symbol)
+        if not f or len(f) < 8:
+            return None
+        try:
+            quote_date = f[7]
+            if not f[1] or not f[2] or not quote_date:
+                return None
+            return {
+                'fund_code': symbol,
+                'fund_name': f[0] or '',
+                'nav_date': quote_date,                     # 今日交易日（估值日）
+                'dwjz': float(f[3]) if f[3] else None,      # 昨日单位净值
+                'estimate_nav': float(f[2]),                # 盘中估算净值
+                'estimate_growth': float(f[6]) if f[6] else None,  # 估算涨跌幅%
+                'estimate_time': f"{quote_date} {f[1]}",    # 估值时间
+                'semantic': 'intraday_estimate',            # 盘中估算
+                'is_intraday': True,
+            }
+        except (ValueError, IndexError) as e:
+            self.logger.warning(f"_fetch_estimate_nav_sina_fu({symbol})字段解析失败: {e}")
+            return None
+
+    def _fetch_estimate_nav_sina_of_sync(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """新浪 of_ 行情 —— 确认收盘净值（债券基金等 fu_ 无数据时的兜底）
+
+        响应格式（实测）：
+          var hq_str_of008114="天弘中证红利低波动100ETF联接A,1.6505,1.7534,1.65,0.03,2026-10-23";
+          [0]=名称 [1]=单位净值 [2]=累计净值 [3]=? [4]=涨跌幅% [5]=日期
+        """
+        f = self._sina_quote("of", symbol)
+        if not f or len(f) < 6:
+            return None
+        try:
+            quote_date = f[5]
+            if not f[1] or not quote_date:
+                return None
+            return {
+                'fund_code': symbol,
+                'fund_name': f[0] or '',
+                'nav_date': quote_date,                      # 确认净值日期
+                'dwjz': float(f[3]) if f[3] else None,       # 前一日净值
+                'estimate_nav': float(f[1]),                 # 确认收盘净值
+                'estimate_growth': float(f[4]) if f[4] else None,  # 涨跌幅%
+                'estimate_time': f"{quote_date} 15:00:00",  # 收盘时点
+                'semantic': 'confirmed_close',               # ★ 确认收盘，不是盘中估算
+                'is_intraday': False,
+            }
+        except (ValueError, IndexError) as e:
+            self.logger.warning(f"_fetch_estimate_nav_sina_of({symbol})字段解析失败: {e}")
             return None
 
     def _normalize_nav(self, raw: Dict[str, Any], symbol: str) -> Dict[str, Any]:

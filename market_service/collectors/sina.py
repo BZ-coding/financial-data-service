@@ -31,6 +31,25 @@ class SinaCollector(BaseCollector):
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Referer': 'https://finance.sina.com.cn',
         })
+        # ⚠️ 2026-10-26：挂 urllib3 Retry（read 阶段错误也重试）
+        #   RemoteDisconnected 属**读阶段**错误，urllib3 默认不重试 → 一次断连即整条采集失败。
+        #   重试会重建连接（urllib3 会把断连的连接标记为坏并丢弃）。
+        #   ⚠️ 重试次数必须与 timeout 匹配：sina 的 timeout=10s，read 重试 2 次
+        #     → 最坏 10s x 3 = 30s < 60s 的 scheduler tick，不会拖慢调度。
+        try:
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
+            retry = Retry(
+                total=0, connect=0, read=2, backoff_factor=0.5,
+                status_forcelist=(429, 500, 502, 503, 504),
+                allowed_methods=None, raise_on_status=False,
+            )
+            adapter = HTTPAdapter(max_retries=retry, pool_connections=2, pool_maxsize=2)
+            self.session.mount("https://", adapter)
+            self.session.mount("http://", adapter)
+        except Exception as e:
+            self.logger = logging.getLogger(__name__)
+            self.logger.warning(f"配置 Session Retry 失败（沿用默认）: {e}")
 
     async def collect(self, symbol: str, data_type: str = 'price', **kwargs) -> CollectResult:
         if data_type != 'price':

@@ -50,6 +50,26 @@ class EastMoneyCollector(BaseCollector):
         self.session = requests.Session()
         self.session.headers.update(self.headers)
         self.logger = logging.getLogger(__name__)
+        # ⚠️ 2026-10-26：挂 urllib3 Retry（read 阶段错误也重试）
+        #   RemoteDisconnected 属**读阶段**错误，urllib3 默认不重试 → 一次断连即整条采集失败。
+        #   重试会重建连接（urllib3 会把断连的连接标记为坏并丢弃）。
+        #   ⚠️ 但**重试次数必须与 timeout 匹配**，否则最坏耗时会成倍放大：
+        #     本 collector timeout=8，读重试 2 次 → 最坏 8s x 3 = 24s。
+        #     （8084 的 scheduler tick 是 60s，单次采集不能超过它）
+        try:
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
+            retry = Retry(
+                total=0, connect=0, read=2, backoff_factor=0.5,
+                status_forcelist=(429, 500, 502, 503, 504),
+                allowed_methods=None, raise_on_status=False,
+            )
+            adapter = HTTPAdapter(max_retries=retry, pool_connections=2, pool_maxsize=2)
+            self.session.mount("https://", adapter)
+            self.session.mount("http://", adapter)
+        except Exception as e:
+            self.logger = logging.getLogger(__name__)
+            self.logger.warning(f"配置 Session Retry 失败（沿用默认）: {e}")
 
     def _get(self, url: str, params: Dict = None, timeout: int = 8) -> Optional[Dict]:
         try:

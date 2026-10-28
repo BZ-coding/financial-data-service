@@ -296,16 +296,39 @@ class Database:
             return False
 
     def insert_news_aggregator(self, data: Dict[str, Any]) -> bool:
-        """插入全网聚合新闻（news_aggregator采集器）"""
+        """插入全网聚合新闻（news_aggregator采集器）
+
+        ⚠️ 2026-10-26 瘦身：原来的 `raw_data` 存的是 `json.dumps(data)`，
+        而 data 里的 hackernews/github_trending/ths_news 三组 items
+        **已经被单独存进 hackernews_items / github_items / ths_items 三列**，
+        → **同一份 items 被完整存了两遍**。
+        实测：raw_data 列共 256.9 MB（14,925 行，平均 17.6 KB/行，最大 29.7 KB），
+              其中 items 的重复部分占绝大多数（抽样：11.2 KB/行 → 去掉 items 后 0.3 KB/行）。
+        而 **API 的 get_latest_news_aggregator 根本不读 raw_data**
+        （只 SELECT 6 个独立列 + ingested_at）→ raw_data 是纯冗余。
+
+        现在 raw_data 只保留**去掉 items 之后的元信息**（保留可追溯性，不再重复存储）。
+        预计该列从 256.9 MB 降到约 6 MB。
+        """
         try:
+            # 去掉各源的 items（已单独存列），只留元信息
+            meta = {k: v for k, v in data.items() if k not in ("hackernews", "github_trending", "ths_news")}
+            for k in ("hackernews", "github_trending", "ths_news"):
+                if k in data and isinstance(data[k], dict):
+                    meta[k] = {kk: vv for kk, vv in data[k].items() if kk != "items"}
             self.conn.execute("""
                 INSERT OR REPLACE INTO news_aggregator_data (
                     source, collected_at,
                     hackernews_count, hackernews_items,
                     github_count, github_items,
                     ths_count, ths_items,
-                    raw_data, ingested_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    raw_data, ingested_at,
+                    caijing_count, caijing_items, caijing_status,
+                    eeo_count, eeo_items, eeo_status,
+                    sina_live_count, sina_live_items, sina_live_status,
+                    ths_hk_count, ths_hk_items, ths_hk_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP,
+                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 'news_aggregator',
                 data.get('collected_at', ''),
@@ -315,7 +338,20 @@ class Database:
                 json.dumps(data.get('github_trending', {}).get('items', []), ensure_ascii=False),
                 data.get('ths_news', {}).get('count', 0),
                 json.dumps(data.get('ths_news', {}).get('items', []), ensure_ascii=False),
-                json.dumps(data, ensure_ascii=False),
+                json.dumps(meta, ensure_ascii=False),
+                # ★ 2026-10-28：四个财经快讯源 + 显式 status（source_unavailable/empty/ok）
+                data.get('caijing', {}).get('count', 0),
+                json.dumps(data.get('caijing', {}).get('items', []), ensure_ascii=False),
+                data.get('caijing_status', 'source_unavailable'),
+                data.get('eeo', {}).get('count', 0),
+                json.dumps(data.get('eeo', {}).get('items', []), ensure_ascii=False),
+                data.get('eeo_status', 'source_unavailable'),
+                data.get('sina_live', {}).get('count', 0),
+                json.dumps(data.get('sina_live', {}).get('items', []), ensure_ascii=False),
+                data.get('sina_live_status', 'source_unavailable'),
+                data.get('ths_hk', {}).get('count', 0),
+                json.dumps(data.get('ths_hk', {}).get('items', []), ensure_ascii=False),
+                data.get('ths_hk_status', 'source_unavailable'),
             ))
             self.conn.commit()
             return True
@@ -352,6 +388,10 @@ class Database:
                    hackernews_count, hackernews_items,
                    github_count, github_items,
                    ths_count, ths_items,
+                   caijing_count, caijing_items, caijing_status,
+                   eeo_count, eeo_items, eeo_status,
+                   sina_live_count, sina_live_items, sina_live_status,
+                   ths_hk_count, ths_hk_items, ths_hk_status,
                    ingested_at
             FROM news_aggregator_data
             ORDER BY ingested_at DESC
@@ -361,7 +401,8 @@ class Database:
         if row:
             d = dict(row)
             # 反序列化 JSON 字段
-            for field in ['hackernews_items', 'github_items', 'ths_items']:
+            for field in ['hackernews_items', 'github_items', 'ths_items',
+                         'caijing_items', 'eeo_items', 'sina_live_items', 'ths_hk_items']:
                 if d.get(field) and isinstance(d[field], str):
                     try:
                         d[field] = json.loads(d[field])
@@ -567,22 +608,45 @@ class Database:
     def get_price_history(self, symbol: str, days: int = 30) -> List[Dict[str, Any]]:
         """获取历史行情"""
         start_time = datetime.now(TZ) - timedelta(days=days)
+        # trade_time 混用 ISO("2026-10-28T...") 和 compact("20261027 15:00:00") 格式，
+        # 直接字符串排序会因 "-"(0x2D) < 数字而把 compact 行永远排在前面。
+        # 用 CASE 把 compact 归一化为 ISO 格式再排序。
         cur = self.conn.execute("""
             SELECT trade_time, price, volume, amount, high, low, open, prev_close
             FROM price_data
             WHERE symbol = ? AND trade_time >= ?
-            ORDER BY trade_time ASC
+            ORDER BY CASE
+                WHEN trade_time LIKE '____-__-__%'
+                    THEN replace(substr(trade_time,1,19),'T',' ')
+                ELSE substr(trade_time,1,4)||'-'||substr(trade_time,5,2)||'-'||substr(trade_time,7,2)||' '||substr(trade_time,10,8)
+            END ASC
         """, (symbol, start_time))
         return [dict(row) for row in cur.fetchall()]
 
-    def get_latest_price(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """获取最新行情，直接返回最新数据"""
-        cur = self.conn.execute("""
+    def get_latest_price(self, symbol: str, source: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """获取最新行情，直接返回最新数据
+
+        source 不为空时按来源过滤（原先忽略 source，导致点名 eastmoney
+        却返回别的来源的行情，排查时容易被误导）。
+        """
+        # trade_time 混用 ISO/compact 两种格式，必须归一化后排序，否则 compact 行永远胜出
+        sql = """
             SELECT * FROM price_data
             WHERE symbol = ?
-            ORDER BY trade_time DESC
+        """
+        params: List[Any] = [symbol]
+        if source and source != "*":
+            sql += " AND source = ?"
+            params.append(source)
+        sql += """
+            ORDER BY CASE
+                WHEN trade_time LIKE '____-__-__%'
+                    THEN replace(substr(trade_time,1,19),'T',' ')
+                ELSE substr(trade_time,1,4)||'-'||substr(trade_time,5,2)||'-'||substr(trade_time,7,2)||' '||substr(trade_time,10,8)
+            END DESC
             LIMIT 1
-        """, (symbol,))
+        """
+        cur = self.conn.execute(sql, tuple(params))
         row = cur.fetchone()
         if not row:
             return None
@@ -1049,9 +1113,9 @@ class Database:
 
     def delete_subscription(self, sub_id: int) -> bool:
         """删除订阅"""
-        cur = self.conn.execute("DELETE FROM subscriptions WHERE id = ?", (sub_id,))
+        n = self._dml("DELETE FROM subscriptions WHERE id = ?", (sub_id,))
         self.conn.commit()
-        return cur.rowcount > 0
+        return n > 0
 
     def get_all_subscriptions(self) -> List[Dict[str, Any]]:
         """获取所有订阅（显式列以保证新增字段可见）"""
@@ -1096,12 +1160,12 @@ class Database:
 
     def update_ticket_status(self, ticket_id: int, status: str) -> bool:
         """更新工单状态"""
-        cur = self.conn.execute("""
+        n = self._dml("""
             UPDATE tickets SET status = ?, updated_at = datetime('now','localtime')
             WHERE id = ?
         """, (status, ticket_id))
         self.conn.commit()
-        return cur.rowcount > 0
+        return n > 0
 
     def add_ticket_comment(self, ticket_id: int, author: str, content: str) -> bool:
         """添加工单评论（JSON存储）"""
@@ -1210,34 +1274,70 @@ class Database:
 
     # ==================== CLEANUP ====================
 
-    def cleanup_old_data(self, retention_days: Dict[str, int]) -> Dict[str, int]:
-        """清理过期数据，返回各表删除行数"""
+    # 清理策略定义：(表名, 时间列, retention_days 配置键, 默认保留天数, 说明)
+    # ⚠️ 2026-10-26 重写。原实现有三个问题，全部已修：
+    #   ① **必然抛异常**：`DELETE FROM news_data WHERE timestamp < ?` —— news_data 表
+    #      **没有 timestamp 列**（实际是 ingested_at/published/updated_at），
+    #      这条 DELETE 直接 `no such column: timestamp` → 函数在第一条就崩，
+    #      **后面的 price_data / collection_log 清理根本执行不到**。
+    #      这就是它「有定义、零调用方」的深层原因：就算调用了也必然失败。
+    #   ② **collection_log 保留期硬编码 30 天**，不读配置 → 无法调整。
+    #   ③ **不覆盖几个最大的表**（news_aggregator_data 756MB / mmx_search_data 265MB），
+    #      而 collection_log 连索引合计 435MB —— 库体积大头完全没被管。
+    CLEANUP_POLICIES = [
+        ("collection_log",      "started_at",  "log_days",           30, "采集日志（表+索引合计 435MB）"),
+        # price_data 默认 60 → 90 天：dsa-mcp 的 analyze_trend(days=60) 要 60 天窗口，
+        # 保留期正好卡在 60 天会在边界删掉刚采到的数据 → 留 30 天余量
+        ("price_data",          "trade_time",  "price_days",         90, "实时行情快照（dsa-mcp 需 60 天窗口，留 30 天余量）"),
+        ("news_data",           "ingested_at", "news_days",          30, "个股新闻（link UNIQUE，删后可重采）"),
+        ("minute_data",         "trade_date",  "minute_days",        60, "分钟K线"),
+        ("estimate_nav_data",   "ingested_at", "estimate_nav_days",  30, "盘中估算净值"),
+        ("news_aggregator_data","ingested_at", "aggregator_days",    14, "全网聚合新闻（单行可达 30KB）"),
+        ("mmx_search_data",     "collected_at","mmx_search_days",    90, "财经搜索结果（长期无消费）"),
+    ]
+
+    def cleanup_old_data(self, retention_days: Dict[str, int], dry_run: bool = False) -> Dict[str, Any]:
+        """清理过期数据。
+
+        Args:
+            retention_days: {配置键: 保留天数}，缺省用 CLEANUP_POLICIES 里的默认天数
+            dry_run: True = **只统计不删除**（默认应先用这个看清单）
+
+        Returns:
+            {"deleted": {表名: 行数}, "cutoffs": {表名: 截止时间}, "dry_run": bool}
+        """
         now = datetime.now(TZ)
         deleted_counts = {}
+        cutoffs = {}
 
-        # 清理新闻
-        cutoff_news = now - timedelta(days=retention_days.get('news_days', 30))
-        cur = self.conn.execute("DELETE FROM news_data WHERE timestamp < ?", (cutoff_news,))
-        deleted_counts['news'] = cur.rowcount
+        for table, time_col, cfg_key, default_days, desc in self.CLEANUP_POLICIES:
+            days = int(retention_days.get(cfg_key, default_days))
+            cutoff = now - timedelta(days=days)
+            cutoff_s = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+            cutoffs[table] = {"cutoff": cutoff_s, "retention_days": days, "desc": desc}
+            try:
+                if dry_run:
+                    cur = self.conn.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE {time_col} < ?", (cutoff_s,))
+                    n = cur.fetchone()[0]
+                else:
+                    # ⚠️ 用 _dml（total_changes 增量 + 唯一化 SQL），
+                    #    不用 rowcount / SELECT changes()：Python 3.12+ 的
+                    #    statement cache 会让计数误报 0，且同 SQL 第二次可能不执行
+                    n = self._dml(
+                        f"DELETE FROM {table} WHERE {time_col} < ?", (cutoff_s,))
+                deleted_counts[table] = n
+            except Exception as e:
+                # ⚠️ 不再静默失败：单表失败要明确记录，其余表继续
+                logger.error(f"cleanup_old_data 清理 {table} 失败: {type(e).__name__}: {e}")
+                deleted_counts[table] = f"ERROR: {type(e).__name__}: {e}"
 
-        # 清理行情
-        cutoff_price = now - timedelta(days=retention_days.get('price_days', 60))
-        cur = self.conn.execute("DELETE FROM price_data WHERE trade_time < ?", (cutoff_price,))
-        deleted_counts['price'] = cur.rowcount
-
-        # 清理公告
-        cutoff_ann = now - timedelta(days=retention_days.get('announcement_days', 90))
-        # TODO: 如有announcement表
-        # cur = self.conn.execute(...)
-
-        # 清理日志（30天前）
-        cutoff_log = now - timedelta(days=30)
-        cur = self.conn.execute("DELETE FROM collection_log WHERE started_at < ?", (cutoff_log,))
-        deleted_counts['collection_log'] = cur.rowcount
-
-        self.conn.commit()
-        logger.info(f"清理完成: {deleted_counts}")
-        return deleted_counts
+        if dry_run:
+            logger.info(f"清理干跑（不删除）: {deleted_counts}")
+        else:
+            self.conn.commit()
+            logger.info(f"清理完成: {deleted_counts}")
+        return {"deleted": deleted_counts, "cutoffs": cutoffs, "dry_run": dry_run}
 
     # ==================== FAILED TRANSFORMS（死信队列）====================
 
@@ -1608,6 +1708,38 @@ class Database:
         params.append(limit)
         cur = self.conn.execute(sql, params)
         return [dict(r) for r in cur.fetchall()]
+
+    def _dml(self, sql: str, params: tuple = ()) -> int:
+        """执行一条 DML，返回**实际影响的行数**（不依赖 cursor.rowcount）。
+
+        ⚠️ 2026-10-26：Python 3.12+ 的 sqlite3 有 **statement cache**，
+        实测（Python 3.14.4）有两个坑：
+          ① 上一次语句是 SELECT 时，后续 execute() 返回的 cursor 的
+             **rowcount 恒为 0** —— 即使 DML 真的生效了；
+          ② **同一 SQL 文本连续执行两次，第二次会静默不执行**
+             （total_changes 也不变）—— 因为复用了缓存的 prepared statement。
+        坑 ② 对"清理任务要幂等"是致命的。
+
+        对策：
+          - 用 **`Connection.total_changes` 的增量**（连接级累计计数，
+            完全不受 statement cache 影响）而不是 rowcount / SELECT changes()
+          - 给 SQL 加**唯一注释后缀**，确保每次都是新的 statement（避开缓存复用）
+        """
+        # ⚠️ 必须先 commit：实测（Python 3.14.4）**事务未结束时**同一 SQL 文本连续执行，
+        #   第二次会被 statement cache 跳过 → **静默不执行**（rowcount 与 total_changes 都不变）。
+        #   commit 后再执行则两次都正常生效。
+        try:
+            self.conn.commit()
+        except Exception:
+            pass
+        before = self.conn.total_changes
+        self.conn.execute(sql, params)
+        return int(self.conn.total_changes - before)
+
+    def _changes(self) -> int:
+        """兼容别名：取最近一条 DML 影响的行数。"""
+        return self._dml("SELECT 1") if False else int(
+            self.conn.execute("SELECT changes()").fetchone()[0] or 0)
 
     def close(self):
         """关闭连接"""

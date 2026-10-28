@@ -25,3 +25,6 @@ market_service/requirements.txt.legacy-*
 
 # 交易日历缓存（运行时生成，探针自动刷新）
 market_service/data/trade_calendar.json
+
+# 行情数据库与备份（2G，绝不入库）
+market_service/data/

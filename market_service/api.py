@@ -89,7 +89,7 @@ async def get_data(
             elif data_type == "price":
                 # 直接返回最新数据，不做过期检查
                 # 调用方可根据 trade_time 自行判断数据时效性
-                row = db.get_latest_price(symbol)
+                row = db.get_latest_price(symbol, source=source if source != "*" else None)
                 if not row:
                     raise HTTPException(404, "行情数据不存在")
                 return row

@@ -13,6 +13,7 @@ News Aggregator - 全网新闻聚合采集器
 """
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -235,6 +236,175 @@ class NewsAggregatorCollector(BaseCollector):
 
     # ==================== 主采集入口 ====================
 
+    # ==================== 财经快讯四源（2026-10-28 恢复）====================
+    #
+    # 这四个源在 **2026-06-11 06:35:57 同时停止**（库里最后写入时间一致），
+    # 采集器实现被移除，但 news_aggregator_data 表里**列还在**（caijing_items 等），
+    # 且有 12,748 行历史数据。
+    # ⚠️ 后果：Hermes 的 cron prompt **明确依赖 `caijing_items`（财经网快讯）**，
+    #    但 API 的 get_latest_news_aggregator 根本不 SELECT 这些列
+    #    → agent 拿到的是"没有这些字段"→ **把"源挂了"误读成"今天没快讯"**。
+    #
+    # 现在恢复采集，并给每个源加**显式状态标记**（ok / empty / source_unavailable），
+    # **绝不静默缺字段**。
+
+    _FIN_SOURCES = ("caijing", "eeo", "sina_live", "ths_hk")
+
+    def _http_get(self, url: str, timeout: int = 12, encoding: str = None) -> Optional[str]:
+        """同步 GET，失败返回 None（调用方据此标 source_unavailable）"""
+        try:
+            resp = requests.get(url, timeout=timeout, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+                "Referer": "https://www.google.com/",
+            })
+            if resp.status_code != 200:
+                logger.warning(f"GET {url} → HTTP {resp.status_code}")
+                return None
+            # 编码：这两个站点是 UTF-8，但 requests 按 header 猜可能猜成 ISO-8859-1
+            # → 中文乱码。显式用 UTF-8 解码（errors='replace' 防个别坏字节）。
+            raw = resp.content
+            for enc in ([encoding] if encoding else []) + ["utf-8", "gbk"]:
+                try:
+                    txt = raw.decode(enc)
+                    # 简单校验：解码结果里若几乎没有中文，多半选错编码
+                    if enc != "gbk" and ("\u4e00" <= txt[:4000] <= "\u9fff") is False and txt.count("\ufffd") > 0:
+                        continue
+                    return txt
+                except (UnicodeDecodeError, LookupError):
+                    continue
+            return raw.decode("utf-8", errors="replace")
+        except Exception as e:
+            logger.warning(f"GET {url} 失败: {type(e).__name__}: {e}")
+            return None
+
+    def _fetch_caijing_sync(self, limit: int = 20) -> Optional[List[Dict[str, Any]]]:
+        """财经网快讯（finance.caijing.com.cn 首页快讯链接解析）"""
+        html = self._http_get("http://finance.caijing.com.cn/")
+        if not html:
+            return None
+        # 注意分组：1=url 2=日期 3=文章号 4=标题（标题在最后）
+        pat = re.compile(
+            r'<a[^>]+href="(http://(?:finance|economy)\.caijing\.com\.cn/(20\d{6})/(\d+)\.shtml)"[^>]*>\s*([^<]{6,60}?)\s*</a>')
+        items, seen = [], set()
+        for m in pat.finditer(html):
+            url, ymd, title = m.group(1), m.group(2), m.group(4).strip()
+            if url in seen or not title:
+                continue
+            seen.add(url)
+            items.append({
+                "source": "caijing",
+                "title": title,
+                "url": url,
+                "published": f"{ymd[4:6]}-{ymd[6:8]} {ymd[8:10] if len(ymd)>8 else ''}".strip(),
+                "cat": "快讯",
+                "caturl": "http://finance.caijing.com.cn/",
+            })
+            if len(items) >= limit:
+                break
+        return items
+
+    def _fetch_eeo_sync(self, limit: int = 10) -> Optional[List[Dict[str, Any]]]:
+        """经济观察网快讯（www.eeo.com.cn 首页链接解析）"""
+        html = self._http_get("http://www.eeo.com.cn/")
+        if not html:
+            return None
+        # 注意分组：1=url 2=年 3=月日 4=文章号 5=标题（标题在最后）
+        pat = re.compile(
+            r'<a[^>]+href="(http://www\.eeo\.com\.cn/(20\d{2})/(\d{4})/(\d+)\.shtml)"[^>]*>\s*([^<]{6,60}?)\s*</a>')
+        items, seen = [], set()
+        for m in pat.finditer(html):
+            url, y, md, title = m.group(1), m.group(2), m.group(3), m.group(5).strip()
+            if url in seen or not title:
+                continue
+            seen.add(url)
+            items.append({
+                "source": "eeo",
+                "title": title,
+                "link": url,
+                "category": "快讯",
+                "pub_date": f"{y}-{md}",
+            })
+            if len(items) >= limit:
+                break
+        return items
+
+    def _fetch_sina_live_sync(self, limit: int = 30) -> Optional[List[Dict[str, Any]]]:
+        """新浪财经直播（zhibo_id=152）"""
+        url = ("https://zhibo.sina.com.cn/api/zhibo/feed?zhibo_id=152&page=1"
+               f"&page_size={limit}&zhibo_feed_content_type=102")
+        txt = self._http_get(url)
+        if not txt:
+            return None
+        try:
+            d = json.loads(txt)
+            lst = d.get("result", {}).get("data", {}).get("feed", {}).get("list", []) or []
+        except Exception as e:
+            logger.warning(f"sina_live 解析失败: {e}")
+            return None
+        items = []
+        for it in lst:
+            items.append({
+                "source": "sina_live",
+                "content": (it.get("rich_text") or "").strip(),
+                "create_time": it.get("create_time") or "",
+                "tag": (it.get("tag") or [{}])[0].get("tag_name", "") if isinstance(it.get("tag"), list) else "",
+            })
+        return items
+
+    def _fetch_ths_hk_sync(self, limit: int = 20) -> Optional[List[Dict[str, Any]]]:
+        """同花顺港股快讯（10jqka push API）"""
+        url = (f"https://news.10jqka.com.cn/tapp/news/push/stock/?page=1&tag=&track=website&pagesize={limit}")
+        txt = self._http_get(url)
+        if not txt:
+            return None
+        try:
+            d = json.loads(txt)
+            lst = d.get("data", {}).get("list", []) or []
+        except Exception as e:
+            logger.warning(f"ths_hk 解析失败: {e}")
+            return None
+        items = []
+        for it in lst:
+            items.append({
+                "source": "ths_hk",
+                "title": it.get("title", ""),
+                "digest": it.get("digest", ""),
+                "ctime": it.get("ctime") or it.get("seq") or "",
+                "tags": it.get("tag", "") or "",
+                "url": it.get("url", "") or "",
+            })
+        return items
+
+    async def fetch_fin_sources(self) -> Dict[str, Any]:
+        """并发采集四个财经快讯源，返回 {源名: {"items": [...], "status": str}}"""
+        fns = {
+            "caijing":   self._fetch_caijing_sync,
+            "eeo":       self._fetch_eeo_sync,
+            "sina_live": self._fetch_sina_live_sync,
+            "ths_hk":    self._fetch_ths_hk_sync,
+        }
+
+        async def one(name):
+            f = fns[name]
+            try:
+                items = await asyncio.to_thread(f)
+            except Exception as e:
+                logger.warning(f"{name} 采集异常: {type(e).__name__}: {e}")
+                items = None
+            if items is None:
+                return name, {"items": [], "status": "source_unavailable"}
+            if not items:
+                return name, {"items": [], "status": "empty"}
+            return name, {"items": items, "status": "ok"}
+
+        results = await asyncio.gather(*[one(n) for n in fns], return_exceptions=True)
+        out = {}
+        for r in results:
+            if isinstance(r, Exception):
+                continue
+            out[r[0]] = r[1]
+        return out
+
     async def collect(
         self,
         symbol: str,
@@ -247,10 +417,16 @@ class NewsAggregatorCollector(BaseCollector):
         hn_task = asyncio.create_task(self.fetch_hackernews())
         gh_task = asyncio.create_task(self.fetch_github_trending())
         ths_task = asyncio.create_task(self.fetch_ths_news())
+        # ★ 2026-10-28：恢复四个财经快讯源（caijing/eeo/sina_live/ths_hk）
+        #   —— Hermes 的 cron prompt 明确依赖 caijing_items（财经网快讯）
+        fin_task = asyncio.create_task(self.fetch_fin_sources())
 
-        hn_results, gh_results, ths_results = await asyncio.gather(
-            hn_task, gh_task, ths_task, return_exceptions=True
+        hn_results, gh_results, ths_results, fin_results = await asyncio.gather(
+            hn_task, gh_task, ths_task, fin_task, return_exceptions=True
         )
+        if isinstance(fin_results, Exception):
+            logger.warning(f"fin sources exception: {fin_results}")
+            fin_results = {}
 
         if isinstance(hn_results, Exception):
             logger.warning(f"HN exception: {hn_results}")
@@ -271,6 +447,13 @@ class NewsAggregatorCollector(BaseCollector):
             "ths_news": {"count": len(ths_results), "items": ths_results},
             "total_sources": sum([1 if hn_results else 0, 1 if gh_results else 0, 1 if ths_results else 0]),
         }
+        # ★ 四个财经快讯源 + **显式状态标记**（绝不静默缺字段）
+        #   status: ok / empty / source_unavailable
+        #   → agent 能分辨"源挂了"和"今天没快讯"
+        for name in ("caijing", "eeo", "sina_live", "ths_hk"):
+            info = (fin_results or {}).get(name) or {"items": [], "status": "source_unavailable"}
+            combined[name] = {"count": len(info.get("items", [])), "items": info.get("items", [])}
+            combined[f"{name}_status"] = info.get("status", "source_unavailable")
 
         return CollectResult(
             success=True,

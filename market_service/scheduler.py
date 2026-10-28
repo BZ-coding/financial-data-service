@@ -43,7 +43,12 @@ class Scheduler:
 
         # 初始化各采集器
         self.collectors = {
-            'akshare': AKShareFetcher(rate_limit_per_minute=self.config['collectors']['akshare']['rate_limit_per_minute']),
+            'akshare': AKShareFetcher(
+                rate_limit_per_minute=self.config['collectors']['akshare']['rate_limit_per_minute'],
+                # 2026-10-26：estimate_nav 信源顺序可配（东财 fundgz 已下线，默认新浪）
+                estimate_nav_sources=self.config['collectors']['akshare'].get(
+                    'estimate_nav_sources', AKShareFetcher.DEFAULT_ESTIMATE_NAV_SOURCES),
+            ),
             'rss': RSSCollector(
                 config_path=Path(__file__).parent / "config" / "rss_config.json",
                 rate_limit_per_second=self.config['collectors']['rss']['rate_limit_per_second']
@@ -299,8 +304,69 @@ class Scheduler:
             f"| 错误: {error_msg[:80]}"
         )
 
+    # A 股交易日历缓存（由 ~/.hermes/scripts/check_trading_day.py 写入，
+    # 数据源 = 新浪 tool_trade_date_hist_sina()，自动更新，7 天有效）
+    _TRADE_CAL_CACHE = Path.home() / ".hermes" / "scripts" / ".trade_calendar_cache.json"
+    _trade_days_cache = None      # 进程内缓存的交易日集合
+    _trade_days_loaded_at = 0.0
+
+    def _is_trading_day(self, dt: datetime) -> bool:
+        """判断是否 A 股交易日（含法定节假日调休）。
+
+        优先读交易日历缓存；缓存缺失/过期/损坏时**降级为"周一至周五"**，
+        保证不会因为日历不可用而误杀正常采集（宁可多采，不可漏采）。
+        """
+        import json as _json
+        import time as _time
+
+        # 周末直接排除（不依赖任何日历）
+        if dt.weekday() >= 5:
+            return False
+
+        now_ts = _time.time()
+        # 注意：这里用 getattr 安全取实例属性（不依赖 __init__，便于单测直接构造）
+        cal = getattr(self, "_trade_days_cache", None)
+        loaded_at = getattr(self, "_trade_days_loaded_at", 0.0)
+        if cal is None or (now_ts - loaded_at) > 3600:
+            cal = None
+            try:
+                cache_path = self._TRADE_CAL_CACHE
+                if cache_path.exists():
+                    age = now_ts - cache_path.stat().st_mtime
+                    if age < 30 * 24 * 3600:      # 缓存超过 30 天视为不可信
+                        with open(cache_path, encoding="utf-8") as f:
+                            days = _json.load(f)
+                        if days:
+                            cal = set(days)
+            except Exception:
+                cal = None
+            self._trade_days_cache = cal
+            self._trade_days_loaded_at = now_ts
+
+        if cal:
+            return dt.strftime("%Y-%m-%d") in cal
+        # 降级：周一至周五视为交易日
+        return dt.weekday() < 5
+
     def _is_trading_hours(self, dt: datetime) -> bool:
-        """判断是否在A股交易时段（9:30-11:30, 13:00-15:00）"""
+        """判断是否在 A 股交易时段（交易日 且 9:30-11:30, 13:00-15:00）
+
+        ⚠️ 2026-10-26 修复：原实现**只判断时段、不判断星期**，
+        导致 `trading_hours_only=1` 的订阅在**周末照样采集**。
+        实际影响：2026-10-26 给「主力资金榜 / 行业板块资金流 / 概念板块资金流」
+        三条订阅加了 trading_hours_only=1（东财收盘后会对本机 IP 断连，见
+        collectors/community_enhanced.py 的注释），若周末仍采集就会：
+          ① 周末白采（数据无意义）  ② 撞上断连 → 单次耗时飙到 70-99s → 拖垮 60s tick。
+
+        现在是**两个维度交叉**：交易日 ∧ 交易时段。
+        交易日判定优先用 A 股交易日历缓存（~/.hermes/scripts/.trade_calendar_cache.json，
+        由 check_trading_day.py 写入，数据源是新浪 tool_trade_date_hist_sina()，自动更新）；
+        缓存不可用时降级为"周一至周五"（不因日历缺失而误杀正常采集）。
+        """
+        # ---- 维度一：必须是交易日 ----
+        if not self._is_trading_day(dt):
+            return False
+        # ---- 维度二：必须在交易时段 ----
         hour = dt.hour
         minute = dt.minute
         return (

@@ -13,6 +13,18 @@ collectors:
     retry_attempts: 3
     retry_backoff_factor: 2
     timeout_seconds: 30
+    # estimate_nav（盘中估算净值）信源顺序，按序尝试，第一个成功即用。
+    # 2026-10-26 背景：东方财富已下线盘中估值服务 ——
+    #   fundgz.1234567.com.cn/js/<code>.js 返回 404 页面但 HTTP 状态码 200
+    #   akshare 自带的 api.fund.eastmoney.com/FundGuZhi 也返回 {"Data":null}
+    # → 原本每天白跑 504 次失败。现改用新浪（实测可用，数据与历史 nav_data 交叉验证一致）。
+    #   sina_fu : 新浪 fu_ 行情（盘中估算净值，semantic=intraday_estimate）
+    #   sina_of : 新浪 of_ 行情（确认收盘净值，semantic=confirmed_close）—— 债券基金等 fu_ 无数据时兜底
+    #   fundgz  : 东方财富 fundgz（已下线，保留以便对方恢复时切回）
+    estimate_nav_sources:
+      - sina_fu
+      - sina_of
+      - fundgz
   rss:
     enabled: true
     rate_limit_per_second: 1

@@ -129,7 +129,7 @@ class HkexEnhancedCollector(BaseCollector):
                         "name": code,
                         "market": "SEHK",
                     },
-                    timeout=45,
+                    timeout=30,   # 2026-10-26: 45→30，配合应用层单次重试，最坏 60s = tick 边界内
                 )
                 if resp.status_code != 200:
                     logger.warning(f"prefix.do HTTP {resp.status_code}, retry")
@@ -188,7 +188,7 @@ class HkexEnhancedCollector(BaseCollector):
             "rowRange": str(row_range),
             "lang": lang,
         }
-        resp = self.session.get(HKEX_TITLE_SEARCH_URL, params=params, timeout=60)
+        resp = self.session.get(HKEX_TITLE_SEARCH_URL, params=params, timeout=30)  # 2026-10-26: 60→30，配合单次重试最坏 60s
         if resp.status_code != 200:
             raise Exception(f"HTTP {resp.status_code}")
         data = resp.json()
@@ -291,22 +291,51 @@ class HkexEnhancedCollector(BaseCollector):
         to_date = to_dt.strftime("%Y%m%d")
 
         # 3. 查询 (run_in_executor 避免阻塞 event loop)
+        #
+        # ⚠️ 2026-10-26：加**应用层重试**（1 次），并把单次 timeout 从 60s 降到 30s。
+        #
+        # 【为什么 hkex 不能像其它源那样挂 urllib3 Retry(read=N)】
+        #   本 collector 的 timeout 是 45~60s（港交所 SSL 慢，chain.py 的 SLOW_SOURCES
+        #   也给它 60s）。若挂 urllib3 的 read 重试，总耗时 = timeout x (1+重试次数)：
+        #       read=2 → 60 x 3 = 180s
+        #       read=3 → 60 x 4 = 240s
+        #   而 8084 的 scheduler tick 只有 **60s** —— 单次采集超过 60s 会**拖垮调度**
+        #   （这正是 2026-07-29 那次 8084 死锁的同类问题）。
+        #   → **timeout 大的源不能用"多层重试"，只能用"单层 + 降 timeout"**。
+        #
+        # 【为什么仍值得加这一层重试】
+        #   hkex_announcement 的三条订阅（id 47/48/45）是 **1440 分钟（每天仅 1 次）**
+        #   —— 全项目**空闲最久**的采集，最容易命中"连接池里的连接被服务端静默关闭"。
+        #   实测也确实出现过 1 次 RemoteDisconnected（"HKEX 请求失败: Connection aborted"）。
+        #   单次重试（最多 30s + 30s = 60s，正好卡在 tick 边界内）足以覆盖瞬时断连。
         loop = asyncio.get_event_loop()
-        try:
-            items = await loop.run_in_executor(
-                None,
-                lambda: self._fetch_announcements_sync(
-                    stock_id, self._strip_hk_prefix(symbol),
-                    from_date=from_date, to_date=to_date,
-                    row_range=min(max_items, 100), lang="EN",
+        items = None
+        last_err = ""
+        for attempt in range(2):          # 最多 2 次尝试（1 次重试）
+            try:
+                items = await loop.run_in_executor(
+                    None,
+                    lambda: self._fetch_announcements_sync(
+                        stock_id, self._strip_hk_prefix(symbol),
+                        from_date=from_date, to_date=to_date,
+                        row_range=min(max_items, 100), lang="EN",
+                    )
                 )
-            )
-        except Exception as e:
-            logger.warning(f"_fetch_announcements_sync({symbol}) 异常: {e}")
+                last_err = ""
+                break
+            except Exception as e:
+                last_err = str(e)
+                logger.warning(
+                    f"_fetch_announcements_sync({symbol}) 异常 "
+                    f"(attempt {attempt+1}/2): {e}"
+                )
+                if attempt == 0:
+                    await asyncio.sleep(1)   # 退避 1s 后重试
+        if items is None:
             return CollectResult(
                 success=False, data=None, source="hkex",
                 symbol=symbol, data_type=data_type,
-                error=f"HKEX 请求失败: {e}",
+                error=f"HKEX 请求失败: {last_err}",
                 duration_seconds=(_now_tz() - start).total_seconds(),
             )
 

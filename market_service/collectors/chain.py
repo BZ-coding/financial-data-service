@@ -61,7 +61,16 @@ class ChainCollector:
     # 每个 data_type 默认的链顺序（可被 source_metrics 动态调整）
     DEFAULT_CHAINS: Dict[str, List[str]] = {
         "nav":          ["akshare"],         # tushare 不支持 nav，只用 akshare
-        "estimate_nav": ["akshare"],          # 只有 fundgz 支持
+        # ⚠️ 2026-10-26 更新（原注释"只有 fundgz 支持"已过时）：
+        #   东方财富 fundgz 已下线（返回 404 页面但 HTTP 200；akshare 自带的
+        #   api.fund.eastmoney.com/FundGuZhi 也返回 {"Data":null}），
+        #   导致 estimate_nav 每天白跑 504 次失败（2026-07-20 起就无数据了）。
+        #   现在由 **akshare collector 内部**按 config 的 estimate_nav_sources
+        #   顺序依次尝试：sina_fu（盘中估算）→ sina_of（确认收盘，债券基金兜底）
+        #   → fundgz（保留在链尾，东财恢复时可切回）。
+        #   注意：本表的链是 **collector 级别**，sina_fu/sina_of 是 akshare collector
+        #   的**内部信源**、不是独立 collector，因此这里仍写 "akshare"。
+        "estimate_nav": ["akshare"],
         "price":        ["akshare", "sina", "tickflow", "massive"],
         "minute":       ["akshare", "tickflow"],
         "daily":        ["tushare", "akshare"],
@@ -363,6 +372,10 @@ class ChainCollector:
             "dwjz": raw.get("dwjz"),
             "estimate_nav": raw["estimate_nav"],
             "estimate_growth": raw.get("estimate_growth"),
+            # ⚠️ 2026-10-26 补：透传 semantic（intraday_estimate / confirmed_close）。
+            #   换新浪源后，债券基金的 fu_ 无数据、会落到 sina_of（**确认收盘净值**），
+            #   若不带这个标记，下游无法区分"盘中估算"和"收盘确认"，会把后者当盘中值用。
+            "semantic": raw.get("semantic"),
             "estimate_time": raw["estimate_time"],
             "raw": raw,
         }
@@ -584,7 +597,10 @@ class ChainCollector:
                 symbol=symbol,
                 source=source,
                 raw_sample=raw_str,
-                error_message=error_msg,
+                # ⚠️ 2026-10-26 修复：原来传的是 error_message=，但方法签名是
+                #    transform_error= → TypeError 被下面的 except Exception 吞掉，
+                #    **死信队列从来没成功入过队**（生产库 failed_transforms 恒为 0 行）。
+                transform_error=error_msg,
                 stack_trace=stack[:2000] if stack else "",
             )
             logger.info(f"  💀 死信已入队: {source}/{data_type}/{symbol} -> {error_msg}")
