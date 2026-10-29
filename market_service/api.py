@@ -56,6 +56,157 @@ app = FastAPI(
     redoc_url="/api/redoc"
 )
 
+# ==================== 写接口 Basic Auth 门禁（2026-10-29 阶段2前置） ====================
+#
+# 背景：8084 的写接口（订阅增删改 / 工单 / 手动采集）原本完全无认证。
+#       一旦将来被门户反代到公网，等于把无认证的写能力暴露到公网 ——
+#       所以阶段 2 开启前必须先给写接口补认证（Chief 指令，最高优先）。
+#
+# 设计决策（都经过只读盘点，见服务端发到群里的报告）：
+#   ① **只保护写，读全开放** —— 读才是门户的价值（/api/v1/data 等 12 个 GET 不动）。
+#   ② **判定用两层**（防未来新增写接口漏配）：
+#       层 1：显式写接口清单 `WRITE_PATHS`（8 个，2026-10-29 从运行中 OpenAPI 盘出来的）
+#       层 2：**任何非 GET/HEAD 方法**兜底都要认证
+#       并集 = 绝不漏。将来加写接口，改了方法就自动被兜底罩住。
+#   ③ **不设网段白名单** —— 写操作一律要密码（LAN 免认证对写操作太宽松）。
+#   ④ **fail-closed** —— 密码未配置时写接口一律 503 拒绝，绝不放行。
+#   ⑤ 密码**另建**、不复用 doc-server 的（权限边界隔离：看报告的密码 ≠ 能改订阅；
+#      泄露影响面隔离：一个泄露不拖另一个下水；轮换独立）。
+#      注入方式与 doc-server 对齐：systemd LoadCredential= → CREDENTIALS_DIRECTORY。
+#      ⚠️ 本服务是 **user 级**单元（user manager 以 zsd 身份读凭据文件），
+#      所以源文件是 zsd 所有 0600（放在 ~/.config/market-data-service-credentials/），
+#      不是 root-only —— 这是 user 单元的能力边界，已在文档里写明。
+#   ⑥ 环境变量 `MARKET_API_PASSWORD` 仅作**本地调试/测试**兜底，生产单元不设它。
+#   ⚠️ 已知残余（如实记录，不在本次范围）：
+#     - `/api/v1/tickets`、`/api/v1/tickets/{id}/comment`、`/api/v1/collect` 是
+#       纯 query 参数的 POST → **简单请求**，浏览器跨源发起时**不触发预检** →
+#       Basic Auth 挡不住 CSRF（除非浏览器里缓存了 8084 的凭据）。
+#       现状写接口仅 LAN 可达且不会被反代（阶段2 明确不反代写接口），风险面有限。
+#       若将来要防，需要求自定义请求头（如 X-Requested-With）或校验 Origin。
+#     - `POST /api/v1/subscriptions` 在文件里注册了**两次**（L303/L330，后者是死代码，
+#       且 `trading_hours_only`/`backup_sources` 参数永远到不了实际 handler）——
+#       历史遗留 bug，不在本次范围，已报告。
+
+WRITE_PATHS = (
+    ("POST", "/api/v1/subscriptions"),
+    ("PUT", "/api/v1/subscriptions/{sub_id}"),
+    ("DELETE", "/api/v1/subscriptions/{sub_id}"),
+    ("PATCH", "/api/v1/subscriptions/{sub_id}/toggle"),
+    ("POST", "/api/v1/tickets"),
+    ("PATCH", "/api/v1/tickets/{ticket_id}/status"),
+    ("POST", "/api/v1/tickets/{ticket_id}/comment"),
+    ("POST", "/api/v1/collect"),
+)
+_WRITE_BASIC_REALM = 'Basic realm="Market Data Service", charset="UTF-8"'
+
+import base64 as _base64
+import hmac as _hmac
+
+
+def _load_market_api_password() -> Optional[str]:
+    """取写接口密码。顺序：LoadCredential 目录 → 环境变量（调试用）。
+
+    返回 None = 未配置 → 调用方必须 fail-closed（503 拒绝）。
+    """
+    cred_dir = os.environ.get("CREDENTIALS_DIRECTORY", "")
+    if cred_dir:
+        try:
+            p = Path(cred_dir) / "market-api-password"
+            v = p.read_text(encoding="utf-8").strip()
+            if v:
+                return v
+        except Exception:
+            pass
+    v = os.environ.get("MARKET_API_PASSWORD", "").strip()
+    return v or None
+
+
+def _path_is_write(request: Request) -> bool:
+    """该请求是否命中显式写接口清单（层 1）—— **方法 + 路径模板都要匹配**。
+
+    ⚠️ 2026-10-29 自测抓到的一个自己的 bug：
+       最初只按**路径模板**匹配，忘了方法 → `GET /api/v1/subscriptions` 与
+       `POST /api/v1/subscriptions` **共用同一个路径模板** → 读接口被误判成写接口
+       → 读接口也 401（实测发现的，不是想出来的）。
+       → 必须 (method, template) **成对**匹配。
+    """
+    path = request.url.path
+    for m, tpl in WRITE_PATHS:
+        if request.method != m:
+            continue
+        t_seg = tpl.split("/")
+        p_seg = path.split("/")
+        if len(t_seg) != len(p_seg):
+            continue
+        if all(a == b or a.startswith("{") for a, b in zip(t_seg, p_seg)):
+            return True
+    return False
+
+
+def _is_write_request(request: Request) -> bool:
+    """两层判定：显式清单 + 非 GET/HEAD 方法兜底。"""
+    if request.method not in ("GET", "HEAD"):
+        return True
+    return _path_is_write(request)
+
+
+def _check_write_auth(request: Request):
+    """返回 (放行, reason)。密码未配置 → (False, "no_password") 即 fail-closed。"""
+    pw = _load_market_api_password()
+    if not pw:
+        return False, "no_password_configured"
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Basic "):
+        return False, "missing_credentials"
+    try:
+        decoded = _base64.b64decode(auth[6:]).decode("utf-8")
+    except Exception:
+        return False, "malformed_credentials"
+    _, _, pwd = decoded.partition(":")
+    if _hmac.compare_digest(pwd, pw):
+        return True, "ok"
+    return False, "bad_credentials"
+
+
+@app.middleware("http")
+async def write_auth_middleware(request: Request, call_next):
+    """写接口门禁（只拦写，放行读；fail-closed；无白名单）。
+
+    ⚠️ 写接口被拒时**绝不落凭据**（Authorization 头不写日志），
+    只记 method/path/client/reason。
+    """
+    if not _is_write_request(request):
+        return await call_next(request)
+
+    ok, reason = _check_write_auth(request)
+    if ok:
+        return await call_next(request)
+
+    try:
+        ip = request.client.host if request.client else "unknown"
+    except Exception:
+        ip = "unknown"
+    if reason == "no_password_configured":
+        logger.error(
+            f"写接口拒绝：未配置访问密码（MARKET_API_PASSWORD / LoadCredential），"
+            f"fail-closed 拒绝一切写操作。{request.method} {request.url.path} 来自 {ip}")
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "写接口未配置访问密码，已拒绝（fail-closed）"},
+            headers={"Cache-Control": "no-store"},
+        )
+    logger.warning(
+        f"写接口认证失败：{request.method} {request.url.path} 来自 {ip} 原因={reason}")
+    return JSONResponse(
+        status_code=401,
+        content={"detail": "写接口需要 Basic Auth"},
+        headers={
+            "WWW-Authenticate": _WRITE_BASIC_REALM,
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 # 挂载静态文件
 static_dir = Path(__file__).parent / "static"
 if static_dir.exists():
