@@ -25,8 +25,10 @@ r"""safe_ops —— 统一的安全删除 / 安全计数封装（防"LIKE 通配
 --------------------
     -- 错：'_' 是通配符
     WHERE name LIKE '__%'
-    -- 对：用 ESCAPE 把 '_' 变成字面量
-    WHERE name LIKE '__\_%' ESCAPE '\'
+    -- 对：用 ESCAPE 把**每一个** '_' 都转义成字面量
+    --     ⚠️ SQLite 的 LIKE 里 '_' 是单字符通配符；
+    --        匹配字面下划线必须**每个都转义**：两个 '_' → '\_\_'
+    WHERE name LIKE '__\_\_%' ESCAPE '\'
     -- 或者：干脆不用 LIKE
     WHERE substr(name, 1, 2) = '__'
     -- 或者用 GLOB（通配符是 * ?，没有 '_'）
@@ -50,6 +52,19 @@ WILDCARD_INTENT = "safe-like-intent"
 
 #: 默认删除行数上限：超过就中止（除非 force=True）
 DEFAULT_MAX_ROWS = 5
+
+#: **全局兜底上限**：无论调用点把 max_rows 传多大（哪怕 10**9），
+#: 实际生效的上限都不会超过这里 —— "忘传 max_rows"或"传了个巨大值"
+#: 都不可能变成"无上限删除"。
+#: 确需批量删除时，走 expect_rows（精确期望值护栏）或显式 max_rows=None。
+HARD_MAX_ROWS = 1000
+
+#: 哨兵：**区分"调用点没传 max_rows"与"显式传了某个值"**。
+#: - 没传 + 给了 expect_rows → 上限取 expect_rows（不能被默认值误伤）
+#: - 没传 + 没给 expect_rows → 上限取 DEFAULT_MAX_ROWS
+#: - 显式传 None → 显式取消上限（打 WARNING）
+#: - 显式传整数 → min(该值, HARD_MAX_ROWS)
+_UNSET = object()
 
 #: 命中 LIKE 的字面量模式（单引号或双引号）
 _LIKE_LITERAL_RE = re.compile(r"\bLIKE\s+('([^']*)'|\"([^\"]*)\")", re.IGNORECASE)
@@ -93,7 +108,8 @@ def assert_no_unescaped_like(sql: str) -> None:
             raise UnsafeSQLError(
                 f"SQL 中的 LIKE 字面量含未转义通配符: {literal!r} —— "
                 f"'_' 在 LIKE 里是**单字符通配符**，会误匹配（如 '__%' = 至少两个字符的任意串）。\n"
-                f"  正确写法：LIKE '__\\_%' ESCAPE '\\'  /  substr(name,1,2)='__'  /  GLOB '__*'\n"
+                f"  正确写法：LIKE '__\\_\\_%' ESCAPE '\\'（**每个 '_' 都要转义**）\n"
+                f"            或 substr(name,1,2)='__'  /  GLOB '__*'（GLOB 没有 '_' 通配符）\n"
                 f"  若确实想用通配符，请在 SQL 里加注释标记: {WILDCARD_INTENT}\n"
                 f"  原 SQL: {sql.strip()[:200]}"
             )
@@ -103,7 +119,8 @@ def like_prefix(prefix: str) -> Tuple[str, str]:
     """构造"字面前缀匹配"的 (pattern, escape_clause)。
 
     >>> like_prefix("__")
-    ('__\\_%', " ESCAPE '\\'")
+    ('\\_\\_%', " ESCAPE '\\'")
+    #        ↑ 两个下划线**各自**都被转义（只转义一个会匹配不到 → 静默漏删）
     """
     escaped = prefix.replace("\\", "\\\\").replace("_", "\\_").replace("%", "\\%")
     return f"{escaped}%", " ESCAPE '\\'"
@@ -118,8 +135,9 @@ def safe_delete(
     sql: str,
     params: Sequence[Any] = (),
     *,
-    max_rows: int = DEFAULT_MAX_ROWS,
+    max_rows: Optional[int] = _UNSET,   # type: ignore[assignment]
     force: bool = False,
+    expect_rows: Optional[int] = None,
     reason: str = "",
 ) -> int:
     """带**影响行数上限**的删除。
@@ -134,11 +152,38 @@ def safe_delete(
       5. 否则 COMMIT，返回实际删除行数
 
     Args:
-        max_rows: 允许删除的最大行数。**清理历史数据的批量删除**请显式传
-            期望值（例如先 dry-run 数出来的行数），让"删多了"能被察觉。
+        max_rows: 允许删除的最大行数。**受全局兜底 :data:`HARD_MAX_ROWS` 约束**：
+            传再大的值也不会超过它 → "忘传"或"传巨大值"都不可能变成无上限删除。
+            - **不传** 且给了 ``expect_rows`` → 上限自动取 ``expect_rows``
+              （否则默认值会误伤"期望删 100 行"这种合法批量删除）
+            - **不传** 且没给 ``expect_rows`` → 上限取 :data:`DEFAULT_MAX_ROWS`
+            - 显式传 ``None`` → **显式取消上限**（仅用于已人工确认过的批量清理，
+              会打 WARNING 日志留痕）
+        expect_rows: **精确期望值**护栏 —— 实际删除行数必须**正好等于**它，
+            否则回滚。适合"清理历史数据"这类行数本就很大的场景
+            （此时 max_rows 的硬上限会误伤，用 expect_rows 更合适）。
         force: True 时跳过上限检查（仅用于已人工确认过的批量清理）。
     """
     assert_no_unescaped_like(sql)
+
+    # ---- 全局兜底：无论调用点怎么传，都不可能变成"无上限删除" ----
+    if max_rows is None:
+        cap = None
+        logger.warning(
+            "safe_delete **显式取消行数上限**（max_rows=None）—— 仅限已人工确认的批量清理: %s",
+            sql.strip()[:120],
+        )
+    elif max_rows is _UNSET:
+        # 没传：给了 expect_rows 就以它为上限（否则默认值会误伤合法批量删除）
+        cap = int(expect_rows) if expect_rows is not None else DEFAULT_MAX_ROWS
+    else:
+        cap = int(max_rows)
+        if cap > HARD_MAX_ROWS:
+            logger.warning(
+                "safe_delete max_rows=%s 超过全局兜底 %s → 已按 %s 执行: %s",
+                cap, HARD_MAX_ROWS, HARD_MAX_ROWS, sql.strip()[:120],
+            )
+            cap = HARD_MAX_ROWS
 
     before = conn.total_changes
     try:
@@ -149,18 +194,32 @@ def safe_delete(
     try:
         conn.execute(sql, tuple(params))
         deleted = _delta_total_changes(conn, before)
-        if deleted > max_rows and not force:
+        if expect_rows is not None and deleted != expect_rows and not force:
+            # 精确期望值护栏（更具体，优先于上限检查）
             conn.rollback()
             raise UnsafeDeleteError(
-                f"删除影响 {deleted} 行 > 上限 {max_rows} 行 → **已回滚，未删除任何数据**。"
+                f"删除影响 {deleted} 行，与**期望值 {expect_rows} 行**不符 → **已回滚，未删除任何数据**。"
                 f"{'（reason: ' + reason + '）' if reason else ''}\n"
-                f"  如果这确实是预期删除量，请显式传 max_rows={deleted} 或 force=True。\n"
+                f"  行数不符通常意味着：并发写入 / 判据漂移 / WHERE 条件被误写。\n"
+                f"  SQL: {sql.strip()[:200]}"
+            )
+        if cap is not None and deleted > cap and not force:
+            conn.rollback()
+            raise UnsafeDeleteError(
+                f"删除影响 {deleted} 行 > 上限 {cap} 行 → **已回滚，未删除任何数据**。"
+                f"{'（reason: ' + reason + '）' if reason else ''}\n"
+                f"  全局兜底上限为 {HARD_MAX_ROWS}（传再大的 max_rows 也不会超过它）。\n"
+                f"  如果这确实是预期删除量：请显式传 max_rows={deleted}（≤{HARD_MAX_ROWS}）"
+                f"或改用 expect_rows={deleted}（精确期望值）。\n"
                 f"  SQL: {sql.strip()[:200]}"
             )
         conn.commit()
         logger.info(
-            "safe_delete 执行完成：删除 %s 行（上限 %s%s）: %s",
-            deleted, max_rows, ", force" if force else "", sql.strip()[:120],
+            "safe_delete 执行完成：删除 %s 行（上限 %s%s%s）: %s",
+            deleted,
+            "不限" if cap is None else cap,
+            f", 期望 {expect_rows}" if expect_rows is not None else "",
+            ", force" if force else "", sql.strip()[:120],
         )
         return deleted
     except Exception:

@@ -1330,11 +1330,17 @@ class Database:
                     expected = self.conn.execute(
                         f"SELECT COUNT(*) FROM {table} WHERE {time_col} < ?", (cutoff_s,)
                     ).fetchone()[0]
+                    # NOTE: expect_rows (exact expectation), not max_rows:
+                    #   purging history can legitimately delete tens of thousands of rows;
+                    #   max_rows is bounded by the global fallback (HARD_MAX_ROWS=1000) and
+                    #   would misfire (it would roll back a legitimate purge). expect_rows
+                    #   means it must delete EXACTLY this many rows; any mismatch
+                    #   (concurrent write / predicate drift) -> rollback.
                     n = safe_delete(
                         self.conn,
                         f"DELETE FROM {table} WHERE {time_col} < ?", (cutoff_s,),
-                        max_rows=int(expected),
-                        reason=f"清理过期数据 {table}（期望 {expected} 行）",
+                        expect_rows=int(expected),
+                        reason=f"purge expired {table} (expect {expected} rows)",
                     )
                 deleted_counts[table] = n
             except Exception as e:

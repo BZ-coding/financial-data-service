@@ -33,6 +33,9 @@ from typing import List, Tuple
 BASE = Path(__file__).resolve().parent
 WILDCARD_INTENT = "safe-like-intent"
 
+# keep in sync with safe_ops.DEFAULT_MAX_ROWS
+DEFAULT_MAX_ROWS = 5
+
 #: LIKE + 字面量
 LIKE_LITERAL_RE = re.compile(r"\bLIKE\s+('([^']*)'|\"([^\"]*)\")", re.IGNORECASE)
 #: 写操作语句里含 LIKE
@@ -119,6 +122,22 @@ def scan_file(path: Path) -> Tuple[List[str], List[str]]:
                         f"{path.name}:{first.lineno} 直接 execute('DELETE ...') → "
                         f"建议改走 safe_ops.safe_delete()（有影响行数上限，超阈值自动回滚）"
                     )
+
+    # safe_delete call sites: did the caller pass a row limit explicitly?
+    if tree is not None:
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Name) and func.id == "safe_delete"):
+                continue
+            kw_names = {k.arg for k in node.keywords if k.arg}
+            if not (kw_names & {"max_rows", "expect_rows"}):
+                warnings.append(
+                    f"{path.name}:{node.lineno} safe_delete() without explicit "
+                    f"max_rows/expect_rows -> falls back to default cap "
+                    f"{DEFAULT_MAX_ROWS} (still safe, but state the intent)"
+                )
 
     return violations, warnings
 
