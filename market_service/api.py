@@ -153,6 +153,26 @@ def _is_write_request(request: Request) -> bool:
     return _path_is_write(request)
 
 
+def _safe_compare_digest(a: Any, b: Any) -> bool:
+    """常量时间比较，**两边都先 encode 成 bytes**。
+
+    ⚠️ **2026-10-29 验收员实测撞到的坑**：`hmac.compare_digest` 对**含非 ASCII 的 str**
+       会抛 **TypeError**（它只支持 ASCII-only 的 str，或两边都是 bytes）。
+       → 客户端送一个非 ASCII 的密码/签名 → TypeError → 冒泡成 **500**，
+         而不是应有的 **401/403**（验收员第一次撞到时以为"所有写接口都坏了"）。
+
+       修法：**两边都 `.encode("utf-8")`** → 类型统一 → 不会抛 TypeError，
+       非 ASCII 的密码只是**比对不相等** → 正常返回 401/403。
+
+    ⚠️ 这也顺带保证了"客户端送什么类型都不会把服务打成 500"。
+    """
+    try:
+        return _hmac.compare_digest(
+            str(a).encode("utf-8"), str(b).encode("utf-8"))
+    except Exception:
+        return False
+
+
 def _check_write_auth(request: Request):
     """返回 (放行, reason)。密码未配置 → (False, "no_password") 即 fail-closed。"""
     pw = _load_market_api_password()
@@ -166,7 +186,7 @@ def _check_write_auth(request: Request):
     except Exception:
         return False, "malformed_credentials"
     _, _, pwd = decoded.partition(":")
-    if _hmac.compare_digest(pwd, pw):
+    if _safe_compare_digest(pwd, pw):
         return True, "ok"
     return False, "bad_credentials"
 
@@ -294,7 +314,7 @@ def _check_portal_signature(request: Request):
         return False, "timestamp_out_of_window"
     msg = f"{ts}\n{request.method.upper()}\n{request.url.path}".encode("utf-8")
     expected = _hmac.new(key, msg, hashlib.sha256).hexdigest()
-    if not _hmac.compare_digest(sig, expected):
+    if not _safe_compare_digest(sig, expected):
         return False, "bad_signature"
     return True, "ok"
 
