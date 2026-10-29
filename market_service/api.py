@@ -9,6 +9,7 @@ import sys
 import os
 import json
 import logging
+import ipaddress
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from pathlib import Path
@@ -168,9 +169,95 @@ def _check_write_auth(request: Request):
     return False, "bad_credentials"
 
 
+# ---------------------------------------------------------------------------
+# CSRF 双保险（2026-10-29，Chief 批准，与 Basic Auth 叠加）
+# ---------------------------------------------------------------------------
+#
+# 为什么要第二道：Basic Auth **挡不住 CSRF**。
+#   浏览器的 HTTP Auth 缓存是**按 origin** 的：用户在 8084 上认证过一次后，
+#   任意网站都能用 `fetch(..., {credentials:'include'})` 让浏览器**自动带上
+#   已缓存的 Basic Auth** → 跨站页面就能改订阅、触发采集。
+#
+#   而 `/api/v1/tickets`、`/tickets/{id}/comment`、`/api/v1/collect` 是
+#   **纯 query 参数的 POST** → 属于 CORS 定义的**简单请求** → **不触发预检**
+#   → 浏览器直接就把请求发出去 → Basic Auth 被自动带上 → CSRF 成立。
+#
+# 两道保险（**任一不满足即 403**）：
+#   ① **必须带自定义头 `X-Requested-With: market-api`**
+#      → 自定义头会让请求变成**非简单请求** → 浏览器**必须先发 CORS 预检**，
+#        而 8084 **没有 CORS 配置** → 预检拿不到允许头 → 跨站请求**发不出去**。
+#        这是主力防线。
+#   ② **Origin 校验**（Origin 存在时必须属于可信来源；`null` 一律拒绝）
+#      → 双保险：即使将来给 8084 加了 CORS，预检放行了，Origin 这道还在。
+#
+# ⚠️ **不能只靠 Origin**：curl / 脚本**默认不带 Origin** → 只靠 Origin 会把
+#    正常脚本消费方全挡掉。所以 Origin **缺失时不判负**，由 ① 兜底。
+#    （curl 消费方需要自己加 `-H "X-Requested-With: market-api"`，已写进文档）
+#
+# ⚠️ **绝不加在读接口上** —— 读接口对消费方必须完全无感（dsa-mcp / 探针 / hermes
+#    全部只 GET，零打断是硬要求）。本检查**只在写路径**执行。
+CSRF_HEADER = "X-Requested-With"
+CSRF_HEADER_VALUE = "market-api"
+# 可信来源主机（Origin 的 host 部分）。8084 只在本机 / LAN 可达。
+CSRF_TRUSTED_HOSTS = ("127.0.0.1", "localhost", "::1")
+CSRF_TRUSTED_NETS = ("192.168.10.0/24",)
+
+
+def _origin_host_trusted(origin: str) -> bool:
+    """Origin 的 host 是否可信。"""
+    if not origin or origin == "null":
+        return False
+    # 取 scheme://host[:port] 的 host 部分
+    rest = origin.split("://", 1)[1] if "://" in origin else origin
+    host = rest.split("/", 1)[0]
+    if host.startswith("["):                      # [::1]:8084
+        host = host[1:host.find("]")] if "]" in host else host
+    else:
+        host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    if host.lower() in CSRF_TRUSTED_HOSTS:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    for net in CSRF_TRUSTED_NETS:
+        try:
+            if ip in ipaddress.ip_network(net):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _check_csrf(request: Request):
+    """CSRF 双保险校验。返回 (放行, reason)。"""
+    # ① 自定义头必须带（主力防线：让请求变成非简单请求 → 触发预检 → 跨站发不出去）
+    if request.headers.get(CSRF_HEADER) != CSRF_HEADER_VALUE:
+        return False, "missing_or_wrong_custom_header"
+    # ② Origin（存在时）必须可信；null 一律拒绝
+    origin = request.headers.get("origin")
+    if origin is not None:
+        if origin == "null":
+            return False, "null_origin"
+        if not _origin_host_trusted(origin):
+            return False, "untrusted_origin"
+    else:
+        # 没有 Origin（curl/脚本）→ 走 Referer 兜底；也没有就靠 ① 兜底
+        referer = request.headers.get("referer")
+        if referer:
+            ref_origin = referer.split("?", 1)[0]
+            if not _origin_host_trusted(ref_origin):
+                return False, "untrusted_referer"
+    return True, "ok"
+
+
 @app.middleware("http")
 async def write_auth_middleware(request: Request, call_next):
     """写接口门禁（只拦写，放行读；fail-closed；无白名单）。
+
+    顺序：**Basic Auth → CSRF 双保险**。
+      先 401（没凭据）再 403（CSRF 不合格）—— 语义上更准：
+      "你没证明身份"和"你证明了身份但来源不可信"是两回事。
 
     ⚠️ 写接口被拒时**绝不落凭据**（Authorization 头不写日志），
     只记 method/path/client/reason。
@@ -179,32 +266,52 @@ async def write_auth_middleware(request: Request, call_next):
         return await call_next(request)
 
     ok, reason = _check_write_auth(request)
-    if ok:
-        return await call_next(request)
-
-    try:
-        ip = request.client.host if request.client else "unknown"
-    except Exception:
-        ip = "unknown"
-    if reason == "no_password_configured":
-        logger.error(
-            f"写接口拒绝：未配置访问密码（MARKET_API_PASSWORD / LoadCredential），"
-            f"fail-closed 拒绝一切写操作。{request.method} {request.url.path} 来自 {ip}")
+    if not ok:
+        try:
+            ip = request.client.host if request.client else "unknown"
+        except Exception:
+            ip = "unknown"
+        if reason == "no_password_configured":
+            logger.error(
+                f"写接口拒绝：未配置访问密码（MARKET_API_PASSWORD / LoadCredential），"
+                f"fail-closed 拒绝一切写操作。{request.method} {request.url.path} 来自 {ip}")
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "写接口未配置访问密码，已拒绝（fail-closed）"},
+                headers={"Cache-Control": "no-store"},
+            )
+        logger.warning(
+            f"写接口认证失败：{request.method} {request.url.path} 来自 {ip} 原因={reason}")
         return JSONResponse(
-            status_code=503,
-            content={"detail": "写接口未配置访问密码，已拒绝（fail-closed）"},
+            status_code=401,
+            content={"detail": "写接口需要 Basic Auth"},
+            headers={
+                "WWW-Authenticate": _WRITE_BASIC_REALM,
+                "Cache-Control": "no-store",
+            },
+        )
+
+    # ── Basic Auth 通过 → 再过 CSRF 双保险 ──────────────────────────
+    csrf_ok, csrf_reason = _check_csrf(request)
+    if not csrf_ok:
+        try:
+            ip = request.client.host if request.client else "unknown"
+        except Exception:
+            ip = "unknown"
+        logger.warning(
+            f"写接口 CSRF 拒绝：{request.method} {request.url.path} 来自 {ip} "
+            f"原因={csrf_reason}（凭据已通过，来源不可信）")
+        return JSONResponse(
+            status_code=403,
+            content={
+                "detail": "写接口拒绝：CSRF 防护未通过",
+                "reason": csrf_reason,
+                "required_header": f"{CSRF_HEADER}: {CSRF_HEADER_VALUE}",
+            },
             headers={"Cache-Control": "no-store"},
         )
-    logger.warning(
-        f"写接口认证失败：{request.method} {request.url.path} 来自 {ip} 原因={reason}")
-    return JSONResponse(
-        status_code=401,
-        content={"detail": "写接口需要 Basic Auth"},
-        headers={
-            "WWW-Authenticate": _WRITE_BASIC_REALM,
-            "Cache-Control": "no-store",
-        },
-    )
+
+    return await call_next(request)
 
 
 # 挂载静态文件
@@ -477,40 +584,6 @@ async def create_subscription(
 
 
 
-
-@app.post("/api/v1/subscriptions")
-async def create_subscription(
-    name: str,
-    type: str,  # akshare|rss|api
-    config: Dict[str, Any],
-    data_types: List[str],
-    symbol: Optional[str] = None,
-    frequency_min: int = 60,
-    trading_hours_only: bool = False,
-    backup_sources: Optional[str] = None
-):
-    """创建新订阅"""
-    try:
-        sub_id = db.add_subscription(
-            name=name,
-            type_=type,
-            config=config,
-            data_types=data_types,
-            frequency_min=frequency_min,
-            symbol=symbol
-        )
-        if trading_hours_only or backup_sources:
-            db.conn.execute("""
-                UPDATE subscriptions SET
-                    trading_hours_only = ?,
-                    backup_sources = ?
-                WHERE id = ?
-            """, (trading_hours_only, backup_sources, sub_id))
-            db.conn.commit()
-        return {"id": sub_id, "status": "created"}
-    except Exception as e:
-        logger.exception(f"创建订阅失败: {e}")
-        raise HTTPException(500, str(e))
 
 @app.put("/api/v1/subscriptions/{sub_id}")
 async def update_subscription(
