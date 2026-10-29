@@ -8,7 +8,9 @@ import re
 import sys
 import os
 import json
+import time
 import logging
+import hashlib
 import ipaddress
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
@@ -251,17 +253,81 @@ def _check_csrf(request: Request):
     return True, "ok"
 
 
+# ---------------------------------------------------------------------------
+# 回源签名校验（门户阶段 2 反代 → 8084）
+# ---------------------------------------------------------------------------
+#
+# 为什么需要：门户反代走回环访问 8084，8084 看来源是 127.0.0.1 → 走"LAN 免认证"。
+#   如果只靠这个，门户就成了**放大器**：LAN 的开放读权限被放大到公网，
+#   而且**分不清"这是门户的受控反代"还是"有人在 LAN 上直连"**。
+#   → 门户回源必须带 HMAC 签名 + 时间戳；8084 侧验签。
+#     带 X-Portal-Source: portal 的请求 → **必须验签通过**；
+#     不带该头的请求 → 正常路径（LAN 直连 / dsa-mcp / 探针）**不受影响**。
+#
+# 签名算法：HMAC-SHA256(key, "<timestamp>\n<METHOD>\n<path>")
+PORTAL_SOURCE_HEADER = "X-Portal-Source"
+PORTAL_SIG_HEADER = "X-Portal-Signature"
+PORTAL_TS_HEADER = "X-Portal-Timestamp"
+PORTAL_KEY_PATH = Path(os.environ.get(
+    "MARKET_PORTAL_PROXY_KEY",
+    "/home/zsd/.config/market-data-service-credentials/portal-proxy-key"))
+PORTAL_SIG_MAX_SKEW = 300   # 秒；防重放
+
+
+def _check_portal_signature(request: Request):
+    """校验门户回源签名。返回 (放行, reason)。"""
+    try:
+        key = PORTAL_KEY_PATH.read_text(encoding="utf-8").strip().encode("utf-8")
+    except OSError:
+        return False, "no_key"
+    if not key:
+        return False, "no_key"
+    ts = request.headers.get(PORTAL_TS_HEADER, "")
+    sig = request.headers.get(PORTAL_SIG_HEADER, "")
+    if not ts or not sig:
+        return False, "missing_signature_headers"
+    try:
+        t = int(ts)
+    except ValueError:
+        return False, "bad_timestamp"
+    if abs(time.time() - t) > PORTAL_SIG_MAX_SKEW:
+        return False, "timestamp_out_of_window"
+    msg = f"{ts}\n{request.method.upper()}\n{request.url.path}".encode("utf-8")
+    expected = _hmac.new(key, msg, hashlib.sha256).hexdigest()
+    if not _hmac.compare_digest(sig, expected):
+        return False, "bad_signature"
+    return True, "ok"
+
+
 @app.middleware("http")
 async def write_auth_middleware(request: Request, call_next):
     """写接口门禁（只拦写，放行读；fail-closed；无白名单）。
 
-    顺序：**Basic Auth → CSRF 双保险**。
-      先 401（没凭据）再 403（CSRF 不合格）—— 语义上更准：
-      "你没证明身份"和"你证明了身份但来源不可信"是两回事。
+    顺序：**回源签名 → Basic Auth → CSRF 双保险**。
 
     ⚠️ 写接口被拒时**绝不落凭据**（Authorization 头不写日志），
     只记 method/path/client/reason。
     """
+    # ── ⓪ 回源签名校验（对**声称来自门户反代**的请求）────────────────
+    # 门户阶段 2 的反代会带 X-Portal-Source: portal + HMAC 签名 + 时间戳。
+    # 这里校验：**签名错/超时/缺头 → 403**。
+    # ⚠️ 不带 X-Portal-Source 的请求走正常路径（LAN 直连、消费方调用）不受影响。
+    if request.headers.get("X-Portal-Source") == "portal":
+        sig_ok, sig_reason = _check_portal_signature(request)
+        if not sig_ok:
+            try:
+                ip = request.client.host if request.client else "unknown"
+            except Exception:
+                ip = "unknown"
+            logger.warning(
+                f"反代签名校验失败：{request.method} {request.url.path} 来自 {ip} "
+                f"原因={sig_reason}")
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "回源签名校验失败", "reason": sig_reason},
+                headers={"Cache-Control": "no-store"},
+            )
+
     if not _is_write_request(request):
         return await call_next(request)
 
