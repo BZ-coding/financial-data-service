@@ -17,6 +17,7 @@ from typing import Optional, List, Dict, Any
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from safe_ops import safe_delete   # 统一安全删除（影响行数上限保护）
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import yaml
@@ -737,11 +738,17 @@ async def update_subscription(
 
 @app.delete("/api/v1/subscriptions/{sub_id}")
 async def delete_subscription(sub_id: int):
-    """删除订阅"""
-    cur = db.conn.execute("DELETE FROM subscriptions WHERE id = ?", (sub_id,))
-    if cur.rowcount == 0:
+    """删除订阅
+
+    ⚠️ 2026-10-29：改走 safe_delete()（不再用 cursor.rowcount）——
+    Python 3.12+ 的 sqlite3 statement cache 会让 rowcount 恒为 0，
+    表现为"**删成功了却报 404 订阅不存在**"。
+    safe_delete 另有**影响行数上限**保护（max_rows=1，删多了自动回滚）。
+    """
+    n = safe_delete(db.conn, "DELETE FROM subscriptions WHERE id = ?", (sub_id,),
+                    max_rows=1, reason=f"API 删除订阅 id={sub_id}")
+    if n == 0:
         raise HTTPException(404, detail="订阅不存在")
-    db.conn.commit()
     return {"id": sub_id, "status": "deleted"}
 
 @app.patch("/api/v1/subscriptions/{sub_id}/toggle")

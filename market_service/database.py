@@ -10,6 +10,7 @@ from datetime import datetime, date, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 import logging
+from safe_ops import safe_delete   # 统一安全删除（影响行数上限保护）
 
 logger = logging.getLogger(__name__)
 
@@ -1113,8 +1114,8 @@ class Database:
 
     def delete_subscription(self, sub_id: int) -> bool:
         """删除订阅"""
-        n = self._dml("DELETE FROM subscriptions WHERE id = ?", (sub_id,))
-        self.conn.commit()
+        n = safe_delete(self.conn, "DELETE FROM subscriptions WHERE id = ?", (sub_id,),
+                        max_rows=1, reason=f"删除订阅 id={sub_id}")
         return n > 0
 
     def get_all_subscriptions(self) -> List[Dict[str, Any]]:
@@ -1321,11 +1322,20 @@ class Database:
                         f"SELECT COUNT(*) FROM {table} WHERE {time_col} < ?", (cutoff_s,))
                     n = cur.fetchone()[0]
                 else:
-                    # ⚠️ 用 _dml（total_changes 增量 + 唯一化 SQL），
-                    #    不用 rowcount / SELECT changes()：Python 3.12+ 的
-                    #    statement cache 会让计数误报 0，且同 SQL 第二次可能不执行
-                    n = self._dml(
-                        f"DELETE FROM {table} WHERE {time_col} < ?", (cutoff_s,))
+                    # ⚠️ 2026-10-29 加"影响行数上限"护栏：
+                    #    先数出**期望删除量**，再以它为上限删除；若实际删除数与期望
+                    #    不符（并发写入/判据漂移）→ **自动回滚**。
+                    #    （2026-10-29 订阅误删事故 = LIKE 通配符全表命中，无报错无告警
+                    #      —— 这类护栏是流程里缺的一环。）
+                    expected = self.conn.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE {time_col} < ?", (cutoff_s,)
+                    ).fetchone()[0]
+                    n = safe_delete(
+                        self.conn,
+                        f"DELETE FROM {table} WHERE {time_col} < ?", (cutoff_s,),
+                        max_rows=int(expected),
+                        reason=f"清理过期数据 {table}（期望 {expected} 行）",
+                    )
                 deleted_counts[table] = n
             except Exception as e:
                 # ⚠️ 不再静默失败：单表失败要明确记录，其余表继续
@@ -1436,8 +1446,8 @@ class Database:
     def remove_failed_collection(self, fail_id: int) -> bool:
         """删除限频重试记录（重试成功后调用）"""
         try:
-            self.conn.execute("DELETE FROM failed_collections WHERE id = ?", (fail_id,))
-            self.conn.commit()
+            safe_delete(self.conn, "DELETE FROM failed_collections WHERE id = ?", (fail_id,),
+                        max_rows=1, reason=f"删除限频重试记录 id={fail_id}")
             return True
         except Exception as e:
             logger.error(f"remove_failed_collection 失败: {e}")
