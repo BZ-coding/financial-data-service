@@ -631,9 +631,26 @@ async def create_subscription(
     config: Dict[str, Any],
     data_types: List[str],
     symbol: Optional[str] = None,
-    frequency_min: int = 60
+    frequency_min: int = 60,
+    trading_hours_only: bool = False,
+    backup_sources: Optional[str] = None
 ):
-    """创建新订阅"""
+    """创建新订阅。
+
+    ⚠️ **2026-10-29 合并了原"死代码"版本的逻辑**（Chief 批准）：
+       这个端点之前在文件里**注册了两次**，先注册的那份（活）**不透传**
+       `trading_hours_only` / `backup_sources`，后注册的那份（死，永远不命中）
+       才带这两个参数 —— 所以"建订阅时设 trading_hours_only"这个能力**一直调不通**
+       （`db.add_subscription` 本身是支持这两个参数的，是 API 层没往下传）。
+
+       现在直接**一次 INSERT 写全字段**（`db.add_subscription` 原生支持），
+       不再走死代码版的"先 INSERT 再 UPDATE"两步 —— 少一次写、更原子。
+
+    ⚠️ **默认行为完全不变**（回归硬要求）：
+       不传 `trading_hours_only` → 默认 False → 落库 0；
+       不传 `backup_sources`    → 默认 None  → 落库 NULL；
+       与合并前逐字节一致。
+    """
     try:
         sub_id = db.add_subscription(
             name=name,
@@ -641,7 +658,9 @@ async def create_subscription(
             config=config,
             data_types=data_types,
             frequency_min=frequency_min,
-            symbol=symbol
+            symbol=symbol,
+            trading_hours_only=trading_hours_only,
+            backup_sources=backup_sources,
         )
         return {"id": sub_id, "status": "created"}
     except Exception as e:
