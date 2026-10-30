@@ -31,6 +31,16 @@ from pathlib import Path
 # 项目根 = market_service/ 的上一级
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
+# market_service/ 目录本身也要在 sys.path 上：
+#   2026-10-30 根治后，`market_service/database.py` 与 `market_service/api.py`
+#   已改成**包内相对导入优先**（`from .safe_ops import safe_delete`，
+#   平铺导入只作回退）→ 主路径不再依赖这一行。
+#   但**回退分支仍需要它**：平铺导入（`from safe_ops import ...`）只有在
+#   market_service/ 本身在 sys.path 上时才解析得到（safe_ops 是兄弟模块）。
+#   → 两条路径都留着：包内相对导入走主路，平铺回退走保底。
+#   无论从哪个目录、用哪种方式直接跑本脚本，导入都能解析 → 不再依赖
+#   systemd unit 的 Environment=PYTHONPATH（那只是止血期的过渡写法）。
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from market_service.database import Database, TZ  # noqa: E402
 
 DEFAULT_RETENTION = {

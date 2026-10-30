@@ -10,7 +10,19 @@ from datetime import datetime, date, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 import logging
-from safe_ops import safe_delete   # 统一安全删除（影响行数上限保护）
+try:
+    # 包内导入（`market_service.database`）—— **根治后的正规做法**
+    from .safe_ops import safe_delete
+except ImportError:
+    # 平铺导入回退（`market_service/` 本身在 sys.path 上时）
+    #
+    # ⚠️ 2026-10-30 实测：只留平铺导入时，`import market_service.database`
+    #    直接 ModuleNotFoundError（safe_ops 与 database 同级、是**兄弟模块**，
+    #    不是包的子模块 → 不是 `market_service.safe_ops`）
+    #    → 这个模块只能靠「运行脚本时 sys.path[0] 恰好是 market_service/」才导得进来。
+    #    两种写法并存 → 换个入口就崩（2026-10-30 market-db-cleanup 首跑失败即此类）。
+    from safe_ops import safe_delete
+# 统一安全删除（影响行数上限保护）
 
 logger = logging.getLogger(__name__)
 

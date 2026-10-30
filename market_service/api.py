@@ -17,7 +17,15 @@ from typing import Optional, List, Dict, Any
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from safe_ops import safe_delete   # 统一安全删除（影响行数上限保护）
+try:
+    # 包内导入（`market_service.api`）—— **根治后的正规做法**
+    from .safe_ops import safe_delete
+except ImportError:
+    # 平铺导入回退（`market_service/` 本身在 sys.path 上时）
+    # ⚠️ 2026-10-30 实测：只留平铺导入时，`import market_service.api` 直接
+    #    ModuleNotFoundError（safe_ops 是兄弟模块，不是包的子模块）。
+    from safe_ops import safe_delete
+# 统一安全删除（影响行数上限保护）
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import yaml
