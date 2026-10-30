@@ -16,6 +16,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 
+import fin_indicators  # 中性指标库（纯函数，无 IO）
 from fastapi import FastAPI, HTTPException, Query, Request
 try:
     # 包内导入（`market_service.api`）—— **根治后的正规做法**
@@ -835,6 +836,124 @@ async def add_ticket_comment(
 # ==================== 监控接口 ====================
 # ==================== 监控接口 ====================
 # ==================== 监控接口 ====================
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 指标端点（2026-10-31，指标服务：同时服务门户看板与模型）
+#
+# ⚠️ RSI 口径：本端点用 **Wilder 平滑**（与通达信/同花顺一致），
+#    与 dsa-mcp 告警里用的 SMA 历史口径**不同**，两者数字会有差异，刻意保留。
+#    响应里用 `rsi_method` 字段显式标注。
+#
+# ⚠️ 数据新鲜度：指标基于**最后一根日 K 线**，响应里必须带 `data_as_of`，
+#    前端要显示出来，避免用户把盘后数据当实时。
+# ─────────────────────────────────────────────────────────────────────────────
+_SYMBOL_RE = re.compile(r"^[0-9A-Za-z.]{1,16}$")
+
+
+def _validate_symbol(symbol: str) -> str:
+    """symbol 校验（后端自己的防线，不依赖前端）。
+
+    只允许数字/字母/点，长度 1–16 —— 与门户主机清单同一套收紧思路：
+    这里不需要中文、不需要斜杠、不需要任何 URL 语义字符。
+    """
+    s = (symbol or "").strip()
+    if not _SYMBOL_RE.match(s):
+        raise HTTPException(422, "symbol 格式非法：只允许数字/字母/点，长度 1–16")
+    return s
+
+
+def _lookup_name(symbol: str):
+    """尽力查标的名（查不到返回 None，前端显示代码即可）。"""
+    for sql in (
+        "SELECT name FROM minute_data WHERE symbol = ? AND name IS NOT NULL AND name != '' LIMIT 1",
+        "SELECT fund_name AS name FROM nav_data WHERE symbol = ? AND fund_name IS NOT NULL AND fund_name != '' LIMIT 1",
+        "SELECT fund_name AS name FROM estimate_nav_data WHERE symbol = ? AND fund_name IS NOT NULL AND fund_name != '' LIMIT 1",
+    ):
+        try:
+            row = db.conn.execute(sql, (symbol,)).fetchone()
+            if row and row[0]:
+                return str(row[0])
+        except Exception:
+            continue
+    return None
+
+
+@app.get("/api/v1/indicator")
+async def get_indicator(
+    symbol: str = Query(..., description="股票/基金代码"),
+    days: int = Query(60, ge=20, le=250, description="回看天数（K 线根数上限）"),
+):
+    """计算并返回单个标的的技术指标（只读）。
+
+    数据链路：本库 price_data 盘中快照 → fin_indicators.bars_from_intraday 整形为日K
+              → fin_indicators 计算指标（与 dsa-mcp 同一份代码）。
+    """
+    sym = _validate_symbol(symbol)
+    try:
+        items = db.get_price_history(sym, days)
+        if not items:
+            raise HTTPException(404, f"未找到 {sym} 的行情数据（price_data 无记录）")
+        bars = fin_indicators.bars_from_intraday(items)
+        if not bars:
+            raise HTTPException(404, f"{sym} 的行情数据无法整形为日K线")
+
+        import pandas as pd
+        df = pd.DataFrame(bars)
+        close = df["close"]
+        last = float(close.iloc[-1])
+
+        ma = fin_indicators.ma_series(df, (5, 20))
+        ma5 = float(ma["MA5"].iloc[-1]) if pd.notna(ma["MA5"].iloc[-1]) else None
+        ma20 = float(ma["MA20"].iloc[-1]) if pd.notna(ma["MA20"].iloc[-1]) else None
+
+        macd = fin_indicators.macd_series(df)
+        dif = macd["MACD_DIF"]; dea = macd["MACD_DEA"]; bar = macd["MACD_BAR"]
+        death_cross = None
+        if len(df) >= 2:
+            death_cross = bool((dif.iloc[-2] >= dea.iloc[-2]) and (dif.iloc[-1] < dea.iloc[-1]))
+        golden_cross = None
+        if len(df) >= 2:
+            golden_cross = bool((dif.iloc[-2] <= dea.iloc[-2]) and (dif.iloc[-1] > dea.iloc[-1]))
+
+        hl = fin_indicators.high_low_n(df, df, n=20)
+
+        return {
+            "symbol": sym,
+            "name": _lookup_name(sym),
+            "data_as_of": bars[-1]["date"],
+            "bars": len(bars),
+            "close": round(last, 3),
+            "ma": {
+                "ma5": round(ma5, 3) if ma5 is not None else None,
+                "ma20": round(ma20, 3) if ma20 is not None else None,
+                "bias_ma5_pct": round((last - ma5) / ma5 * 100, 2) if ma5 else None,
+            },
+            "macd": {
+                "dif": round(float(dif.iloc[-1]), 4),
+                "dea": round(float(dea.iloc[-1]), 4),
+                "bar": round(float(bar.iloc[-1]), 4),
+                "death_cross": death_cross,
+                "golden_cross": golden_cross,
+            },
+            "rsi": {
+                "rsi6": round(float(fin_indicators.rsi_wilder(df, 6).iloc[-1]), 2),
+                "rsi12": round(float(fin_indicators.rsi_wilder(df, 12).iloc[-1]), 2),
+                "rsi24": round(float(fin_indicators.rsi_wilder(df, 24).iloc[-1]), 2),
+            },
+            "rsi_method": "wilder",
+            "levels": {
+                "high_20d": round(hl["high"], 3) if hl["high"] is not None else None,
+                "low_20d": round(hl["low"], 3) if hl["low"] is not None else None,
+                "at_20d_high": bool(hl["high"] is not None and last >= hl["high"]),
+                "at_20d_low": bool(hl["low"] is not None and last <= hl["low"]),
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"指标计算失败: {e}")
+        raise HTTPException(500, "指标计算失败")
+
 
 @app.get("/api/v1/stats")
 async def get_stats():
