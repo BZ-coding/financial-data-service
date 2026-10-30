@@ -74,7 +74,7 @@ def main():
     print(f"当前大小: {before:.1f} MB")
     print(f"保留期配置: {ret}\n")
 
-    result = db.cleanup_old_data(ret, dry_run=not args.apply)
+    result = db.cleanup_old_data(ret, dry_run=True)  # 【只统计，不删除】
     print(f"{'表':24s} {'保留':>5s} {'截止':20s} {'可删':>12s}")
     print("-" * 68)
     total = 0
@@ -93,21 +93,35 @@ def main():
         db.close()
         return 0
 
-    # 备份 collection_log（最大的表）
-    bak_dir = db_path.parent / "backups"
-    bak_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
-    bak = bak_dir / f"collection_log_{stamp}.jsonl"
-    print(f"→ 备份 collection_log → {bak}")
-    rows = db.conn.execute(
-        "SELECT id, source, data_type, status, error_message, started_at FROM collection_log").fetchall()
-    with open(bak, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(dict(r), ensure_ascii=False) + "\n")
-    print(f"  已备份 {len(rows):,} 行")
+    # ⚠️ 2026-10-31 修正（批评家）：下面这两段原来**先真删一遍再打印表格、
+    #    备份完又真删第二遍**（cleanup_old_data 在 dry_run=not args.apply 时
+    #    已经真删了）。后果：
+    #      · 表格打印的是**第一次真删的行数**（看起来像"可删清单"）
+    #      · 备份发生在第一次删除之后 → 备份的是"删完剩下的"（旧数据没备到！）
+    #      · 最后打印的"删除完成"是**第二次调用** → 几乎恒为全 0，
+    #        被误读成"删除全部失败 / expect_rows 回滚"（2026-10-30 排查即栽在这）
+    #    现在改为：开头 dry_run=True 只统计 → 打印 → 确认真删模式时
+    #    【先备份、再一次性真删】，表格里的数字只是统计，与删除动作分离。
+    if args.apply:
+        # 备份 collection_log（最大的表）—— 必须在**删除之前**
+        bak_dir = db_path.parent / "backups"
+        bak_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
+        bak = bak_dir / f"collection_log_{stamp}.jsonl"
+        print(f"→ 备份 collection_log → {bak}")
+        rows = db.conn.execute(
+            "SELECT id, source, data_type, status, error_message, started_at FROM collection_log").fetchall()
+        with open(bak, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(dict(r), ensure_ascii=False) + "\n")
+        print(f"  已备份 {len(rows):,} 行")
 
-    result = db.cleanup_old_data(ret, dry_run=False)
-    print(f"\n→ 删除完成: {result['deleted']}")
+        # 一次性真删（内部对每张表仍是 COUNT → expect_rows 精确护栏 → DELETE）
+        result = db.cleanup_old_data(ret, dry_run=False)
+        print(f"\n→ 删除完成: {result['deleted']}")
+    else:
+        print("→ （未进入真删模式）")
+
     after = db_size_mb(db_path)
     print(f"→ 当前大小: {before:.1f} MB → {after:.1f} MB（磁盘回收需 VACUUM）")
     db.close()
