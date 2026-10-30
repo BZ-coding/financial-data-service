@@ -31,13 +31,16 @@ def test_indicator_ok():
     r = client.get("/api/v1/indicator", params={"symbol": "002202"})
     assert r.status_code == 200, r.text
     d = r.json()
-    for k in ("symbol", "name", "data_as_of", "bars", "close",
+    for k in ("symbol", "data_as_of", "bars", "close",
               "ma", "macd", "rsi", "rsi_method", "levels"):
         assert k in d, f"缺字段 {k}"
     assert d["symbol"] == "002202"
     assert d["bars"] >= 20
     assert d["data_as_of"]
     assert d["rsi_method"] == "wilder", "RSI 口径必须显式标注（看板要显示）"
+    # N1（2026-10-31）：不返回 name —— 库里无可靠名字源，null 是噪音；
+    # MCP 工具 get_indicators 也不带该键，两处必须一致。
+    assert "name" not in d, "不应返回 name 键（与 MCP 输出保持一致）"
     for k in ("ma5", "ma20", "bias_ma5_pct"):
         assert k in d["ma"]
     for k in ("dif", "dea", "bar", "death_cross", "golden_cross"):

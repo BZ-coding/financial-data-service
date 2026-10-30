@@ -862,22 +862,6 @@ def _validate_symbol(symbol: str) -> str:
     return s
 
 
-def _lookup_name(symbol: str):
-    """尽力查标的名（查不到返回 None，前端显示代码即可）。"""
-    for sql in (
-        "SELECT name FROM minute_data WHERE symbol = ? AND name IS NOT NULL AND name != '' LIMIT 1",
-        "SELECT fund_name AS name FROM nav_data WHERE symbol = ? AND fund_name IS NOT NULL AND fund_name != '' LIMIT 1",
-        "SELECT fund_name AS name FROM estimate_nav_data WHERE symbol = ? AND fund_name IS NOT NULL AND fund_name != '' LIMIT 1",
-    ):
-        try:
-            row = db.conn.execute(sql, (symbol,)).fetchone()
-            if row and row[0]:
-                return str(row[0])
-        except Exception:
-            continue
-    return None
-
-
 @app.get("/api/v1/indicator")
 async def get_indicator(
     symbol: str = Query(..., description="股票/基金代码"),
@@ -919,7 +903,9 @@ async def get_indicator(
 
         return {
             "symbol": sym,
-            "name": _lookup_name(sym),
+            # N1（2026-10-31）：**不返回 name** —— 库里没有可靠标的名来源
+            # （minute_data.name 基本为空串、nav_data.fund_name 只覆盖基金），
+            # 返回 null 只是噪音。MCP 工具 get_indicators 同样不带该键，两处一致。
             "data_as_of": bars[-1]["date"],
             "bars": len(bars),
             "close": round(last, 3),
