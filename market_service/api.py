@@ -1705,6 +1705,11 @@ _CATALOG_ORDER = ("indices", "holdings", "fundflow", "dragon", "limitup", "news"
 _CAT_CACHE: Dict[str, Any] = {"stamp": None, "at": 0.0, "payload": None}
 _CAT_TTL_SECONDS = 60
 
+# L2 分级缓存：key=类别 → {stamp, at, payload}
+#   为什么需要：holdings 要算 12 只的完整指标（实测 ~0.95s），而用户在 L1↔L2 之间会来回点。
+#   stamp 与 L1 同源（_catalog_stamp()），数据一变就全部失效；另有 60s TTL 兜底。
+_L2_CACHE: Dict[str, Any] = {}
+
 
 def _catalog_stamp() -> Any:
     """L1 的失效 stamp：各类别 count + 最新时间。任何一类有变化就重算。"""
@@ -1782,8 +1787,20 @@ async def get_catalog_category(cat: str):
     if cat not in _CATALOG_BUILDERS:
         raise HTTPException(404, f"未知类别 {cat!r}；可用：{', '.join(_CATALOG_ORDER)}")
     try:
+        stamp = _catalog_stamp()
+        now = time.time()
+        cached = _L2_CACHE.get(cat)
+        if (cached and cached["stamp"] == stamp and (now - cached["at"]) < _CAT_TTL_SECONDS):
+            payload = dict(cached["payload"])
+            payload["cached"] = True
+            payload["cache_age_sec"] = round(now - cached["at"], 1)
+            return payload
+
         block = _CATALOG_BUILDERS[cat]()
         block["as_of"] = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+        block["cached"] = False
+        block["cache_age_sec"] = 0
+        _L2_CACHE[cat] = {"stamp": stamp, "at": now, "payload": block}
         return block
     except Exception as e:
         logger.exception(f"类别 {cat} 失败: {e}")
