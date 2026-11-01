@@ -1753,9 +1753,13 @@ async def get_catalog():
                 logger.error(f"类别 {cat} 构建失败: {type(e).__name__}: {e}")
                 block = {"key": cat, "name": cat, "total": 0, "latest": None,
                          "stale": True, "stale_days": None, "items": []}
+            # ⚠️ `count` 的口径**按类别不同**，故显式给 `unit`，避免歧义：
+            #   指数/持仓/榜单 = 标的数；快讯 = **条目数**（不是采集次数）。
+            #   实测：快讯 count=60（4 源条目合计）而 news_aggregator_data 只有 16 行快照。
             cats.append({
                 "key": block["key"], "name": block["name"],
                 "count": block.get("total", 0),
+                "unit": "条" if block["key"] == "news" else "个",
                 "latest": block.get("latest"),
                 "stale": block.get("stale", True),
                 "stale_days": block.get("stale_days"),

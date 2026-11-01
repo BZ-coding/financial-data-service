@@ -40,7 +40,7 @@ def test_catalog_six_categories(catalog):
     keys = [c["key"] for c in catalog["categories"]]
     assert keys == list(CATS), keys
     for c in catalog["categories"]:
-        for k in ("key", "name", "count", "latest", "stale", "stale_days"):
+        for k in ("key", "name", "count", "unit", "latest", "stale", "stale_days"):
             assert k in c, f"{c['key']} 缺 {k}"
 
 
@@ -76,6 +76,13 @@ def test_catalog_stale_flags(catalog):
         assert (by[cat]["stale_days"] or 0) > 30, by[cat]
     # 指数/快讯是近期的
     assert by["news"]["stale"] is False, by["news"]
+    # count 口径不同要显式标单位：快讯是"条"（条目数），其余是"个"（标的数）
+    assert by["news"]["unit"] == "条", by["news"]
+    assert by["indices"]["unit"] == "个", by["indices"]
+    # 快讯 count 是 4 源条目合计，**不等于** news_aggregator_data 的行数（16 次采集快照）
+    n_items = sum((api_mod.db.get_latest_news_aggregator() or {}).get(f"{k}_count") or 0
+                  for k in ("caijing", "eeo", "sina_live", "ths_hk"))
+    assert by["news"]["count"] == n_items, (by["news"]["count"], n_items)
 
 
 # ── L2 ─────────────────────────────────────────────────────────────────────
