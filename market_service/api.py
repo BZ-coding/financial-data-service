@@ -34,12 +34,12 @@ import yaml
 # 数据库导入
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-from market_service.database import Database, now_tz, parse_date
+from market_service.database import Database, now_tz, parse_date, TZ
 # 注: 原先有 `from market_service.collectors.akshare import AKShareFetcher`,
 # 但实际从未引用 (grep 全文件无 usage). 删除以避免 CI smoke test
 # 依赖 akshare 时的 ModuleNotFoundError. 2026-07-03 修复.
 
-from .database import Database, now_tz, parse_date
+from .database import Database, now_tz, parse_date, TZ
 from .scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
@@ -939,6 +939,407 @@ async def get_indicator(
     except Exception as e:
         logger.exception(f"指标计算失败: {e}")
         raise HTTPException(500, "指标计算失败")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 监控页聚合端点（2026-11-01，阶段 1）
+#
+# 为什么聚合：门户反代限速 **30 次/分钟**（app/proxy.py）。若前端按标的循环
+#   （8 只 × 行情+指标 = 16 次/轮，30 秒一轮 = 32 次/分）会直接撞限速，
+#   还会连累其它反代功能。→ 一次请求返回全部，30 秒轮询只占 2 次/分钟。
+#
+# 数据源：全部来自本库（不跨线读 ~/.hermes/）。
+# 清单：`config/watchlist.json`（用户可编辑，按 mtime 热加载，改完不用重启）。
+# ─────────────────────────────────────────────────────────────────────────────
+_WATCHLIST_PATH = Path(__file__).parent / "config" / "watchlist.json"
+_WATCHLIST_CACHE: Dict[str, Any] = {"mtime": None, "items": []}
+_SYMBOL_RE_DASH = re.compile(r"^[0-9A-Za-z.]{1,16}$")
+_KIND_ALLOWED = ("stock", "fund")
+
+# 缓存：stamp = (清单 mtime, 各标的最新数据时间) → 数据一变 stamp 就变，缓存自然失效；
+#      另有 60 秒 TTL 兜底（防止"数据没变但统计口径变了"这类）
+_DASH_CACHE: Dict[str, Any] = {"stamp": None, "at": 0.0, "payload": None}
+_DASH_TTL_SECONDS = 60
+
+# 股票指标的取数窗口 —— **必须与 /api/v1/indicator 的默认 days 相同**（60）
+_INDICATOR_LOOKBACK_DAYS = 60
+
+_NEWS_SOURCE_KEYS = ("caijing", "eeo", "sina_live", "ths_hk")
+_NEWS_DEFAULT_LIMIT = 20
+
+
+def _load_watchlist() -> List[Dict[str, str]]:
+    """读 watchlist.json（按 mtime 缓存）。**任何异常都退回空清单**，不让监控页 500。"""
+    try:
+        mtime = _WATCHLIST_PATH.stat().st_mtime
+    except OSError:
+        return []
+    if _WATCHLIST_CACHE["mtime"] == mtime:
+        return _WATCHLIST_CACHE["items"]
+    items: List[Dict[str, str]] = []
+    try:
+        raw = json.loads(_WATCHLIST_PATH.read_text(encoding="utf-8"))
+        for it in (raw.get("items") if isinstance(raw, dict) else raw) or []:
+            if not isinstance(it, dict):
+                continue
+            sym = str(it.get("symbol") or "").strip()
+            kind = str(it.get("kind") or "stock").strip().lower()
+            if not _SYMBOL_RE_DASH.match(sym) or kind not in _KIND_ALLOWED:
+                continue
+            items.append({
+                "symbol": sym,
+                "name": str(it.get("name") or sym).strip()[:40],
+                "kind": kind,
+            })
+    except Exception as e:
+        logger.error(f"读取 watchlist.json 失败: {type(e).__name__}: {e}")
+        items = []
+    _WATCHLIST_CACHE["mtime"], _WATCHLIST_CACHE["items"] = mtime, items
+    return items
+
+
+def _norm_news_ts(value) -> Optional[str]:
+    """把三种不同格式的时间戳归一化成 'YYYY-MM-DD HH:MM:SS'（本地时区）。
+
+    实测三种（2026-11-01）：
+      · eeo      `pub_date: "2026-1101"`      ← 少一个连字符（上游格式可疑），容错补齐
+      · sina_live`create_time: "2026-11-01 00:49:40"`
+      · ths_hk   `ctime: "1793458081"`        ← unix 秒（字符串）
+    解析不出来 → None（调用方丢弃该条，不猜时间）
+    """
+    if value is None or value == "":
+        return None
+    # unix 时间戳（数字或纯数字字符串，10 位秒 / 13 位毫秒）
+    if isinstance(value, (int, float)) or (isinstance(value, str) and value.strip().isdigit()):
+        try:
+            ts = float(value)
+            if ts > 1e11:      # 毫秒
+                ts /= 1000.0
+            return datetime.fromtimestamp(ts, TZ).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+    s = str(value).strip().replace("T", " ")
+    # "2026-1101" → "2026-11-01"（4 位年 + 4 位月日）
+    m = re.match(r"^(\d{4})-(\d{2})(\d{2})$", s)
+    if m:
+        s = f"{m.group(1)}-{m.group(2)}-{m.group(3)} 00:00:00"
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s[:19] if len(s) >= 19 else s, fmt).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+    return None
+
+
+def _last_data_ts(symbol: str, kind: str) -> str:
+    """该标的最新数据时间（用于缓存 stamp 失效判定）。走索引，很轻。"""
+    try:
+        if kind == "stock":
+            row = db.conn.execute(
+                "SELECT max(trade_time) FROM price_data WHERE symbol = ?", (symbol,)).fetchone()
+        else:
+            row = db.conn.execute(
+                "SELECT max(nav_date) FROM nav_data WHERE symbol = ?", (symbol,)).fetchone()
+        return str(row[0]) if row and row[0] else ""
+    except Exception:
+        return ""
+
+
+def _stale_days(data_as_of) -> Optional[int]:
+    """数据距今天数（按日期算）。解析不了 → None（调用方按"未知"处理）。"""
+    if not data_as_of:
+        return None
+    raw = str(data_as_of)[:10].replace("/", "-")
+    for fmt in ("%Y-%m-%d", "%Y%m%d"):
+        try:
+            d = datetime.strptime(raw if fmt == "%Y-%m-%d" else raw.replace("-", ""), fmt).replace(tzinfo=TZ)
+            return (datetime.now(TZ) - d).days
+        except ValueError:
+            continue
+    return None
+
+
+def _quote_of(symbol: str, kind: str) -> Dict[str, Any]:
+    """单只标的的最新行情。股票=实时价；基金=盘中估值优先、否则 T+1 净值。"""
+    out: Dict[str, Any] = {"last": None, "change_pct": None,
+                           "data_as_of": None, "estimated": False}
+    if kind == "stock":
+        row = db.get_latest_price(symbol)
+        if row:
+            last = row.get("price")
+            prev = row.get("prev_close")
+            out["last"] = float(last) if last is not None else None
+            if out["last"] is not None and prev:
+                try:
+                    out["change_pct"] = round((out["last"] - float(prev)) / float(prev) * 100, 2)
+                except (TypeError, ValueError, ZeroDivisionError):
+                    pass
+            # ⚠️ **必须用市场时间，不是采集时间**（2026-11-01 实测踩到）：
+            #   price_data.trade_time 是**采集时间**（离盘时段也在采，周日也会采），
+            #   raw_data.raw.trade_time 才是**行情时间**。用采集时间会让用户以为
+            #   "周日下午 13:25 还有实时价"，实际那是上一个交易日的收盘价。
+            #   fin_indicators.market_time() 就是干这个的（与日K整形同一套逻辑）。
+            mt = fin_indicators.market_time(row)
+            # 腾讯港股的市场时间形如 "2026/10/30 16:08:12" → 统一成 ISO 破折号形式，
+            # 否则前端显示与后端解析（_stale_days）会不一致
+            out["data_as_of"] = mt.replace("/", "-") if mt else None
+        return out
+
+    # 基金：盘中估值优先（更新更勤），没有就退回 T+1 净值
+    est = db.get_latest_estimate_nav(symbol)
+    if est and est.get("estimate_nav") is not None:
+        out["last"] = float(est["estimate_nav"])
+        g = est.get("estimate_growth")
+        if g is not None:
+            try:
+                out["change_pct"] = round(float(g), 2)
+            except (TypeError, ValueError):
+                pass
+        ts = est.get("estimate_time")
+        out["data_as_of"] = str(ts)[:19].replace("T", " ") if ts else None
+        out["estimated"] = True
+        return out
+    nav = db.get_latest_nav(symbol)
+    if nav:
+        if nav.get("nav") is not None:
+            out["last"] = float(nav["nav"])
+        g = nav.get("change_pct")
+        if g is not None:
+            try:
+                out["change_pct"] = round(float(g), 2)
+            except (TypeError, ValueError):
+                pass
+        d = nav.get("nav_date")
+        out["data_as_of"] = f"{str(d)[:10]} 00:00:00" if d else None
+    return out
+
+
+def _indicators_of(symbol: str, kind: str) -> Dict[str, Any]:
+    """单只标的的指标。股票走盘中快照→日K；基金走净值→退化日K（只用 close）。"""
+    import pandas as pd
+
+    out: Dict[str, Any] = {
+        "ma5": None, "ma20": None, "bias_ma5_pct": None,
+        "macd": {"dif": None, "dea": None, "bar": None,
+                 "death_cross": None, "golden_cross": None},
+        "rsi6": None, "rsi12": None, "rsi24": None,
+        "high_20d": None, "low_20d": None, "at_20d_high": None, "at_20d_low": None,
+        "bars": 0, "data_as_of": None, "insufficient": True,
+    }
+    try:
+        if kind == "stock":
+            # ⚠️ **必须与 /api/v1/indicator 的 days 口径一致**（都是 60）：
+            #   EMA 类指标（MACD/RSI）依赖预热长度，两个端点用不同 days
+            #   会对同一标的给出不同数值 → 用户会以为其中一个算错了。
+            bars = fin_indicators.bars_from_intraday(
+                db.get_price_history(symbol, _INDICATOR_LOOKBACK_DAYS))
+            has_hl = True
+        else:
+            bars = fin_indicators.bars_from_nav(db.get_nav_history(symbol, 400))
+            has_hl = False        # 净值退化后 high/low 无意义 → 新高/新低不适用
+    except Exception as e:
+        logger.error(f"指标取数失败 {symbol}: {type(e).__name__}: {e}")
+        return out
+
+    out["bars"] = len(bars)
+    if not bars:
+        return out
+    out["data_as_of"] = bars[-1]["date"]
+
+    df = pd.DataFrame(bars)
+    close = df["close"]
+    last = float(close.iloc[-1])
+
+    # 小数位数：股票 3 位（与 /api/v1/indicator 完全一致，便于用户对照）；
+    #           基金 4 位（净值本身只有 1.0~1.2 量级，3 位会丢精度）
+    nd = 3 if kind == "stock" else 4
+    ma = fin_indicators.ma_series(df, (5, 20))
+    ma5 = ma["MA5"].iloc[-1]
+    ma20 = ma["MA20"].iloc[-1]
+    if pd.notna(ma5):
+        out["ma5"] = round(float(ma5), nd)
+        if ma5:
+            out["bias_ma5_pct"] = round((last - float(ma5)) / float(ma5) * 100, 2)
+    if pd.notna(ma20):
+        out["ma20"] = round(float(ma20), nd)
+
+    macd = fin_indicators.macd_series(df)
+    dif, dea, bar = macd["MACD_DIF"], macd["MACD_DEA"], macd["MACD_BAR"]
+    out["macd"]["dif"] = round(float(dif.iloc[-1]), 4)
+    out["macd"]["dea"] = round(float(dea.iloc[-1]), 4)
+    out["macd"]["bar"] = round(float(bar.iloc[-1]), 4)
+    if len(df) >= 2:
+        out["macd"]["death_cross"] = bool((dif.iloc[-2] >= dea.iloc[-2]) and (dif.iloc[-1] < dea.iloc[-1]))
+        out["macd"]["golden_cross"] = bool((dif.iloc[-2] <= dea.iloc[-2]) and (dif.iloc[-1] > dea.iloc[-1]))
+
+    for p, key in ((6, "rsi6"), (12, "rsi12"), (24, "rsi24")):
+        try:
+            out[key] = round(float(fin_indicators.rsi_wilder(df, p).iloc[-1]), 2)
+        except Exception:
+            out[key] = None
+
+    if has_hl:
+        hl = fin_indicators.high_low_n(df, df, n=20)
+        if hl["high"] is not None:
+            out["high_20d"] = round(hl["high"], nd)
+            out["at_20d_high"] = bool(last >= hl["high"])
+        if hl["low"] is not None:
+            out["low_20d"] = round(hl["low"], nd)
+            out["at_20d_low"] = bool(last <= hl["low"])
+
+    # 数据不足：bar 太少（<20 算不出 MA20）或最后一根太旧（>7 天，含周末）
+    out["insufficient"] = False
+    if out["bars"] < 20:
+        out["insufficient"] = True
+        out["insufficient_reason"] = f"样本不足（{out['bars']} 根 < 20）"
+    elif out["data_as_of"]:
+        try:
+            last_dt = datetime.strptime(str(out["data_as_of"])[:10], "%Y-%m-%d").replace(tzinfo=TZ)
+            if (datetime.now(TZ) - last_dt).days > 7:
+                out["insufficient"] = True
+                out["insufficient_reason"] = f"数据过期（最后 {out['data_as_of']}）"
+        except Exception:
+            pass
+    return out
+
+
+def _news_block(limit: int = _NEWS_DEFAULT_LIMIT) -> Dict[str, Any]:
+    """4 个中文源的快讯：时间归一化 → 倒序 → 取前 N 条；同时报告每个源的状态。"""
+    row = None
+    try:
+        row = db.get_latest_news_aggregator()
+    except Exception as e:
+        logger.error(f"聚合新闻读取失败: {type(e).__name__}: {e}")
+
+    sources: Dict[str, Any] = {}
+    items: List[Dict[str, Any]] = []
+    if row:
+        for key in _NEWS_SOURCE_KEYS:
+            raw_items = row.get(f"{key}_items") or []
+            status = row.get(f"{key}_status")
+            count = row.get(f"{key}_count")
+            sources[key] = {"status": status, "count": count if count is not None else len(raw_items)}
+            for it in raw_items:
+                if not isinstance(it, dict):
+                    continue
+                ts = _norm_news_ts(
+                    it.get("create_time") or it.get("ctime") or it.get("pub_date")
+                    or it.get("time") or it.get("date"))
+                if not ts:
+                    continue           # 时间解析不出来的丢掉（不猜）
+                title = (it.get("title") or it.get("content") or it.get("digest") or "").strip()
+                if not title:
+                    continue
+                items.append({
+                    "ts": ts,
+                    "source": key,
+                    "title": title[:160],
+                    "url": it.get("link") or it.get("url") or None,
+                })
+    else:
+        for key in _NEWS_SOURCE_KEYS:
+            sources[key] = {"status": "unavailable", "count": 0}
+
+    items.sort(key=lambda x: x["ts"], reverse=True)
+    return {
+        "items": items[:limit],
+        "total": len(items),
+        "limit": limit,
+        "sources": sources,
+        "collected_at": (row or {}).get("collected_at"),
+    }
+
+
+def _health_block() -> Dict[str, Any]:
+    """采集健康：成功率 / 近 24h 失败数 / 降级源。"""
+    out: Dict[str, Any] = {"success_rate_24h": None, "failed_24h": None,
+                           "success_24h": None, "degraded_sources": []}
+    try:
+        st = db.get_stats()
+        c24 = st.get("collection_24h") or {}
+        out["failed_24h"] = c24.get("failed")
+        out["success_24h"] = c24.get("success")
+        out["success_rate_24h"] = st.get("success_rate_24h")
+    except Exception as e:
+        logger.error(f"健康统计读取失败: {type(e).__name__}: {e}")
+    try:
+        rows = db.conn.execute(
+            "SELECT source, data_type, success_rate, consecutive_success "
+            "FROM source_metrics WHERE is_degraded = 1 OR success_rate < 0.9 "
+            "ORDER BY success_rate ASC LIMIT 12").fetchall()
+        out["degraded_sources"] = [
+            {"source": r[0], "data_type": r[1],
+             "success_rate": round(float(r[2]), 3) if r[2] is not None else None,
+             "consecutive_success": r[3]}
+            for r in rows
+        ]
+    except Exception as e:
+        logger.error(f"降级源读取失败: {type(e).__name__}: {e}")
+    return out
+
+
+def _build_dashboard() -> Dict[str, Any]:
+    watchlist = _load_watchlist()
+    quotes, indicators = [], []
+    for entry in watchlist:
+        sym, kind = entry["symbol"], entry["kind"]
+        q = _quote_of(sym, kind)
+        ind = _indicators_of(sym, kind)
+        stale_days = _stale_days(q["data_as_of"])
+        # 阈值：股票 3 天（覆盖周末+1天缓冲）、基金 4 天（净值 T+1 + 周末）
+        threshold = 3 if kind == "stock" else 4
+        quotes.append({
+            "symbol": sym, "name": entry["name"], "kind": kind,
+            "last": q["last"], "change_pct": q["change_pct"],
+            "estimated": q["estimated"], "data_as_of": q["data_as_of"],
+            "stale_days": stale_days,
+            "stale": bool(stale_days is None or stale_days > threshold),
+        })
+        ind_out = {"symbol": sym, "kind": kind, "data_as_of": ind["data_as_of"]}
+        ind_out.update({k: v for k, v in ind.items() if k != "data_as_of"})
+        indicators.append(ind_out)
+    return {
+        "as_of": datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
+        "watchlist_size": len(watchlist),
+        "quotes": quotes,
+        "indicators": indicators,
+        "news": _news_block(),
+        "health": _health_block(),
+    }
+
+
+@app.get("/api/v1/dashboard")
+async def get_dashboard():
+    """监控页聚合数据：行情 + 指标 + 新闻 + 健康，**一次请求返回全部**。
+    （清单固定读 `config/watchlist.json`；不提供临时覆盖参数，避免多种口径并存。）
+
+    为什么聚合：门户反代限速 30 次/分钟，前端按标的循环必撞限速。
+    缓存：stamp =（清单 mtime, 各标的最新数据时间）+ 60 秒 TTL。
+    """
+    global _DASH_CACHE
+    try:
+        watchlist = _load_watchlist()
+        stamp = (
+            _WATCHLIST_CACHE.get("mtime"),
+            tuple((e["symbol"], _last_data_ts(e["symbol"], e["kind"])) for e in watchlist),
+        )
+        now = time.time()
+        cached = _DASH_CACHE
+        if (cached["payload"] is not None and cached["stamp"] == stamp
+                and (now - cached["at"]) < _DASH_TTL_SECONDS):
+            payload = dict(cached["payload"])
+            payload["cached"] = True
+            payload["cache_age_sec"] = round(now - cached["at"], 1)
+            return payload
+
+        payload = _build_dashboard()
+        payload["cached"] = False
+        payload["cache_age_sec"] = 0
+        _DASH_CACHE = {"stamp": stamp, "at": now, "payload": payload}
+        return payload
+    except Exception as e:
+        logger.exception(f"监控聚合失败: {e}")
+        raise HTTPException(500, "监控聚合失败")
 
 
 @app.get("/api/v1/stats")
