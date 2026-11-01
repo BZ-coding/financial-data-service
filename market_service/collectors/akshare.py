@@ -186,6 +186,39 @@ class AKShareFetcher(BaseCollector):
                     return CollectResult(False, None, "akshare", symbol, "minute", "分钟数据不可用", (now_tz()-start).total_seconds())
                 return CollectResult(True, bars, "sina", symbol, "minute", duration_seconds=(now_tz()-start).total_seconds())
 
+            elif data_type == "market_stats":
+                # 市场涨跌统计（sse+szse 汇总，交易所权威数据）
+                # ⚠️ 2026-11-01 接线：bcbc405 当年只建了 _fetch_ 函数没接 collect 分发，
+                #    导致 market_stats 从未进过调度链路（表里只有 7-02 手工测试的存量）。
+                raw = await asyncio.to_thread(self._fetch_market_stats_sync)
+                if raw is None:
+                    return CollectResult(False, None, "akshare", "*", "market_stats", "市场统计数据不可用", (now_tz()-start).total_seconds())
+                return CollectResult(True, raw, "akshare", "*", "market_stats", duration_seconds=(now_tz()-start).total_seconds())
+
+            elif data_type == "limit_up_pool":
+                # 涨停池（ak.stock_zt_pool_em，限最近 30 交易日）
+                # 传"今天"：收盘后东财更新当日数据；非交易日查无数据 → success=False（次日再试）
+                from datetime import datetime, timezone, timedelta
+                _tz = timezone(timedelta(hours=8))
+                trade_date = datetime.now(_tz).strftime('%Y%m%d')
+                items = await asyncio.to_thread(self._fetch_limit_up_pool_sync, trade_date, 100)
+                if items is None:
+                    return CollectResult(False, None, "akshare", "*", "limit_up_pool", "涨停池数据不可用", (now_tz()-start).total_seconds())
+                if not items:
+                    return CollectResult(False, None, "akshare", "*", "limit_up_pool", f"{trade_date} 涨停池无数据（可能非交易日或尚未更新）", (now_tz()-start).total_seconds())
+                return CollectResult(True, items, "akshare", "*", "limit_up_pool", duration_seconds=(now_tz()-start).total_seconds())
+
+            elif data_type == "dragon_tiger":
+                # 龙虎榜当日详情（ak.stock_lhb_detail_em）
+                # 注意：函数内部用"今天"作 trade_date —— 东财收盘后更新，若当天无榜单
+                #（非交易日/当日无上榜股票）返回空 → success=False，不写空快照。
+                items = await asyncio.to_thread(self._fetch_dragon_tiger_today_sync)
+                if items is None:
+                    return CollectResult(False, None, "akshare", "*", "dragon_tiger", "龙虎榜数据不可用", (now_tz()-start).total_seconds())
+                if not items:
+                    return CollectResult(False, None, "akshare", "*", "dragon_tiger", "今日龙虎榜无数据（可能非交易日或尚未更新）", (now_tz()-start).total_seconds())
+                return CollectResult(True, items, "akshare", "*", "dragon_tiger", duration_seconds=(now_tz()-start).total_seconds())
+
             else:
                 return CollectResult(False, None, "akshare", symbol, data_type, f"未知数据类型: {data_type}", (now_tz()-start).total_seconds())
         except Exception as e:

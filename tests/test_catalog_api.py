@@ -69,11 +69,20 @@ def test_catalog_counts_match_db(catalog):
 
 
 def test_catalog_stale_flags(catalog):
-    """龙虎榜/涨停池实测停更 2 个月 → 必须 stale=true 且天数 > 30。"""
+    """stale 判定正确性（2026-11-01 更新）：
+
+    龙虎榜/涨停池的采集链路已修复（bcbc405 只建了半截管道：有 _fetch_ 函数和读
+    端点，但 collect() 无分发分支、scheduler 无入库分支、无订阅 → 只停更）。
+    数据恢复更新后**不能再断言"必须 stale"**——那是把 bug 写成预期。
+    现在断言判定逻辑本身：stale ⟺ stale_days 超阈值（10 天），两者自洽。
+    """
     by = {c["key"]: c for c in catalog["categories"]}
     for cat in ("dragon", "limitup"):
-        assert by[cat]["stale"] is True, by[cat]
-        assert (by[cat]["stale_days"] or 0) > 30, by[cat]
+        stale = by[cat]["stale"]
+        days = by[cat]["stale_days"] or 0
+        assert stale == (days > 10), (cat, stale, days)
+        if not stale:
+            assert days <= 10, (cat, days)
     # 指数/快讯是近期的
     assert by["news"]["stale"] is False, by["news"]
     # count 口径不同要显式标单位：快讯是"条"（条目数），其余是"个"（标的数）

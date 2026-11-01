@@ -206,6 +206,18 @@ class Scheduler:
                 elif data_type in ('main_fund_rank', 'sector_fund_flow'):
                     self.db.insert_fund_flow(item)
                     stored += 1
+                elif data_type in ('limit_up_pool', 'dragon_tiger'):
+                    # ⚠️ 这两类是"批量列表"语义：整批一次入库（save_* 自带逐条
+                    #    INSERT OR REPLACE），不能走上面的"逐 item"循环——
+                    #    循环会把每个 item 当一整批重复入库。
+                    #    所以这里在循环外一次性处理（见下方 _store_batch_result）。
+                    stored += self._store_batch_result(data_type, items)
+                    break
+                elif data_type == 'market_stats':
+                    # 单对象（非列表语义）：dict 整个传给 save
+                    if isinstance(item, dict) and item.get('trade_date'):
+                        stored += 1 if self.db.save_market_stats(item) else 0
+                    break
                 elif data_type == 'mmx_search':
                     # mmx_search 返回 {"items": [...], "collected_at": ..., "query_count": N}
                     # items 元素: {query, title, link, snippet, date}
@@ -263,6 +275,20 @@ class Scheduler:
                 logger.error(f"入库失败 {data_type}: {e}")
         
         return stored
+
+    def _store_batch_result(self, data_type: str, items: list) -> int:
+        """整批入库（limit_up_pool / dragon_tiger）。
+
+        ⚠️ 语义区分：这两类的 save_* 函数吃的是**整批列表**（内部逐条 INSERT OR
+        REPLACE），不是单条记录。_store_result 的通用循环是"逐 item"语义，
+        直接把列表元素喂给 save_* 会把每个元素重复当整批 → 数据膨胀。
+        所以这两类在循环里 break 出来，走这个整批入口。
+        """
+        if data_type == 'limit_up_pool':
+            return self.db.save_limit_up_pool(items) or 0
+        if data_type == 'dragon_tiger':
+            return self.db.save_dragon_tiger(items) or 0
+        return 0
 
     def _load_config(self, path: str) -> Dict[str, Any]:
         with open(path, 'r', encoding='utf-8') as f:
