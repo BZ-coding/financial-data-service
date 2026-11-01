@@ -951,8 +951,6 @@ async def get_indicator(
 # 数据源：全部来自本库（不跨线读 ~/.hermes/）。
 # 清单：`config/watchlist.json`（用户可编辑，按 mtime 热加载，改完不用重启）。
 # ─────────────────────────────────────────────────────────────────────────────
-_WATCHLIST_PATH = Path(__file__).parent / "config" / "watchlist.json"
-_WATCHLIST_CACHE: Dict[str, Any] = {"mtime": None, "items": []}
 _SYMBOL_RE_DASH = re.compile(r"^[0-9A-Za-z.]{1,16}$")
 _KIND_ALLOWED = ("stock", "fund")
 
@@ -966,36 +964,6 @@ _INDICATOR_LOOKBACK_DAYS = 60
 
 _NEWS_SOURCE_KEYS = ("caijing", "eeo", "sina_live", "ths_hk")
 _NEWS_DEFAULT_LIMIT = 20
-
-
-def _load_watchlist() -> List[Dict[str, str]]:
-    """读 watchlist.json（按 mtime 缓存）。**任何异常都退回空清单**，不让监控页 500。"""
-    try:
-        mtime = _WATCHLIST_PATH.stat().st_mtime
-    except OSError:
-        return []
-    if _WATCHLIST_CACHE["mtime"] == mtime:
-        return _WATCHLIST_CACHE["items"]
-    items: List[Dict[str, str]] = []
-    try:
-        raw = json.loads(_WATCHLIST_PATH.read_text(encoding="utf-8"))
-        for it in (raw.get("items") if isinstance(raw, dict) else raw) or []:
-            if not isinstance(it, dict):
-                continue
-            sym = str(it.get("symbol") or "").strip()
-            kind = str(it.get("kind") or "stock").strip().lower()
-            if not _SYMBOL_RE_DASH.match(sym) or kind not in _KIND_ALLOWED:
-                continue
-            items.append({
-                "symbol": sym,
-                "name": str(it.get("name") or sym).strip()[:40],
-                "kind": kind,
-            })
-    except Exception as e:
-        logger.error(f"读取 watchlist.json 失败: {type(e).__name__}: {e}")
-        items = []
-    _WATCHLIST_CACHE["mtime"], _WATCHLIST_CACHE["items"] = mtime, items
-    return items
 
 
 def _norm_news_ts(value) -> Optional[str]:
@@ -1134,6 +1102,13 @@ def _indicators_of(symbol: str, kind: str) -> Dict[str, Any]:
             bars = fin_indicators.bars_from_intraday(
                 db.get_price_history(symbol, _INDICATOR_LOOKBACK_DAYS))
             has_hl = True
+        elif kind == "index":
+            # 指数：index_data → 日K（**内置去重**：剔周末 + 复用快照，见 indexbars 文档）
+            rows = [dict(r) for r in db.conn.execute(
+                "SELECT trade_date, price, open, high, low, volume FROM index_data "
+                "WHERE code = ? ORDER BY trade_date ASC", (symbol,)).fetchall()]
+            bars = fin_indicators.bars_from_index(rows)
+            has_hl = True         # 指数有真实 high/low
         else:
             bars = fin_indicators.bars_from_nav(db.get_nav_history(symbol, 400))
             has_hl = False        # 净值退化后 high/low 无意义 → 新高/新低不适用
@@ -1279,7 +1254,10 @@ def _health_block() -> Dict[str, Any]:
 
 
 def _build_dashboard() -> Dict[str, Any]:
-    watchlist = _load_watchlist()
+    # 2026-11-01：**改为按数据库真实数据**（与 /api/v1/catalog/holdings 同源）。
+    #   原来读 watchlist.json（用户预设 8 只）—— 用户明确说"要我看现在有什么"，
+    #   预设清单不对路 → watchlist.json 已删除，只保留 name_overrides.json（只补名字）。
+    watchlist = _holdings_entries()
     quotes, indicators = [], []
     for entry in watchlist:
         sym, kind = entry["symbol"], entry["kind"]
@@ -1310,19 +1288,21 @@ def _build_dashboard() -> Dict[str, Any]:
 
 @app.get("/api/v1/dashboard")
 async def get_dashboard():
-    """监控页聚合数据：行情 + 指标 + 新闻 + 健康，**一次请求返回全部**。
-    （清单固定读 `config/watchlist.json`；不提供临时覆盖参数，避免多种口径并存。）
+    """持仓概览：行情 + 指标 + 新闻 + 健康，**一次请求返回全部**。
+
+    ⚠️ **2026-11-01 改**：清单不再来自预设文件，而是**数据库里真实有数据的标的**
+       （股票 = price_data 出现过的；基金 = nav_data 且有近期净值，排除陈年残留）。
+       与 /api/v1/catalog/holdings 同源（同一个 `_holdings_entries()`）。
+       `watchlist.json` 已删除；只剩 `config/name_overrides.json` 补名字。
 
     为什么聚合：门户反代限速 30 次/分钟，前端按标的循环必撞限速。
-    缓存：stamp =（清单 mtime, 各标的最新数据时间）+ 60 秒 TTL。
+    缓存：stamp =（各标的 + 其最新数据时间）+ 60 秒 TTL。
     """
     global _DASH_CACHE
     try:
-        watchlist = _load_watchlist()
-        stamp = (
-            _WATCHLIST_CACHE.get("mtime"),
-            tuple((e["symbol"], _last_data_ts(e["symbol"], e["kind"])) for e in watchlist),
-        )
+        entries = _holdings_entries()
+        stamp = tuple((e["symbol"], e["kind"], _last_data_ts(e["symbol"], e["kind"]))
+                      for e in entries)
         now = time.time()
         cached = _DASH_CACHE
         if (cached["payload"] is not None and cached["stamp"] == stamp
@@ -1340,6 +1320,571 @@ async def get_dashboard():
     except Exception as e:
         logger.exception(f"监控聚合失败: {e}")
         raise HTTPException(500, "监控聚合失败")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 目录（catalog）三层导航 + 详情（detail）—— 2026-11-01 阶段 2 改版
+#
+# 为什么改：用户要"看现在有什么、一层一层点进去"，**不要输入框**。
+#   → 显示什么**由数据库真实数据决定**（探 DISTINCT symbol），不再用预设清单。
+#   → 三层：L1 类别（6 类）→ L2 列表 → L3 详情。
+#   → watchlist.json 降级为 name_overrides.json（只补库里取不到的名字）。
+#
+# ⚠️ 非交易日/复用快照的上游缺陷见 fin_indicators.indexbars 模块文档。
+# ─────────────────────────────────────────────────────────────────────────────
+_NAME_OVERRIDES_PATH = Path(__file__).parent / "config" / "name_overrides.json"
+_NAME_OVERRIDES_CACHE: Dict[str, Any] = {"mtime": None, "names": {}}
+_NAME_CACHE: Dict[str, str] = {}          # symbol -> name（进程内，落定就不变）
+
+# 各品类"新鲜度阈值"（天）：超过就标 stale。数值按各自发布节奏定的：
+#   指数 3（覆盖周末）｜持仓 3/4（股票/基金）｜资金流 2｜龙虎榜/涨停池 10（每日数据，超 10 天基本可判定停更）
+_STALE_THRESHOLD = {
+    "indices": 3, "holdings_stock": 3, "holdings_fund": 4,
+    "fundflow": 2, "dragon": 10, "limitup": 10, "news": 1,
+}
+
+# 基金：最新净值超过这么多天就**判定为陈年残留、从"持仓"里排除**
+# （实测 2026-11-01 命中 4 只：000001 止于 2002、270002 止于 2004、110011 止于 2008、161725 止于 4 月）
+_FUND_RETENTION_DAYS = 30
+
+# 资金流/龙虎榜/涨停池 这类"榜单"在 L2 最多返回多少条（一期不做分页/搜索）
+_LIST_CAP = 50
+
+# ⚠️ **按长度倒序**排列：长后缀必须先剥，否则 "-announcement" 会先把
+#    "hk03690-hkex-announcement" 剥成 "hkex"，而 "-hkex-announcement" 再也匹配不上。
+#    （2026-11-01 单测抓到这个顺序 bug）
+_SUB_NAME_SUFFIXES = tuple(sorted((
+    "_行情", "-行情", "(综合)", "（综合）", "(净值)", "（净值）",
+    "基本面", "-announcement", "_announcement",
+    "-hkex-announcement", "_hkex_announcement", "(港股)", "-hkex",
+), key=len, reverse=True))
+
+
+def _load_name_overrides() -> Dict[str, str]:
+    """读 name_overrides.json（mtime 缓存）。读不到就返回空表，不影响其他逻辑。"""
+    try:
+        mtime = _NAME_OVERRIDES_PATH.stat().st_mtime
+    except OSError:
+        return {}
+    if _NAME_OVERRIDES_CACHE["mtime"] == mtime:
+        return _NAME_OVERRIDES_CACHE["names"]
+    names: Dict[str, str] = {}
+    try:
+        raw = json.loads(_NAME_OVERRIDES_PATH.read_text(encoding="utf-8"))
+        src = raw.get("names") if isinstance(raw, dict) else raw
+        for k, v in (src or {}).items():
+            k, v = str(k).strip(), str(v).strip()
+            if k and v:
+                names[k] = v[:40]
+    except Exception as e:
+        logger.error(f"读取 name_overrides.json 失败: {type(e).__name__}: {e}")
+    _NAME_OVERRIDES_CACHE["mtime"], _NAME_OVERRIDES_CACHE["names"] = mtime, names
+    return names
+
+
+def _parse_subscription_name(symbol: str, name: str) -> Optional[str]:
+    """从 subscriptions.name 里解析中文名（格式很脏，见 2026-11-01 实测样本）。
+
+        002202金风科技(综合)     → 金风科技
+        002202金风科技基本面     → 金风科技
+        002202金风-announcement  → 金风
+        hk03690_美团_行情        → 美团
+    """
+    if not name:
+        return None
+    s = str(name).strip()
+    # 去掉开头的代码（允许后面跟 _ 或 -）
+    low = s.lower()
+    if low.startswith(symbol.lower()):
+        s = s[len(symbol):]
+    s = s.strip().lstrip("_- ")
+    # 反复剥离已知后缀（可能叠加，如 "(综合)" 之后还有东西）
+    changed = True
+    while changed:
+        changed = False
+        for suf in _SUB_NAME_SUFFIXES:
+            if s.endswith(suf):
+                s = s[: -len(suf)].strip().rstrip("_- ")
+                changed = True
+    s = s.strip("_- ")
+    if not s:
+        return None
+    # 名字必须是**中文名**：剥完只剩纯 ASCII 短标签（如 "hkex"、"announcement"）
+    # 说明这行本来就没带名字 → 返回 None，让调用方回退到代码。
+    if not any("\u4e00" <= ch <= "\u9fff" for ch in s):
+        return None
+    return s
+
+
+def _resolve_name(symbol: str, kind: str) -> str:
+    """标的名解析（多级回退，全部失败则返回代码）。结果进程内缓存。"""
+    key = f"{kind}:{symbol}"
+    if key in _NAME_CACHE:
+        return _NAME_CACHE[key]
+    name = None
+    # ① 覆盖表（最高优先，用户可手工纠正）
+    name = _load_name_overrides().get(symbol)
+    # ② 指数：index_data.name
+    if not name and kind == "index":
+        try:
+            row = db.conn.execute(
+                "SELECT name FROM index_data WHERE code = ? AND name IS NOT NULL AND name != '' LIMIT 1",
+                (symbol,)).fetchone()
+            if row and row[0]:
+                name = str(row[0]).strip()
+        except Exception:
+            pass
+    # ③ 个股：fund_flow_data 快照里带 name（A股覆盖好）
+    if not name and kind == "stock":
+        for sql in ("SELECT name FROM fund_flow_data WHERE symbol = ? AND name IS NOT NULL AND name != '' LIMIT 1",
+                    "SELECT name FROM dragon_tiger_data WHERE code = ? AND name IS NOT NULL AND name != '' LIMIT 1",
+                    "SELECT name FROM limit_up_pool_data WHERE code = ? AND name IS NOT NULL AND name != '' LIMIT 1"):
+            try:
+                row = db.conn.execute(sql, (symbol,)).fetchone()
+                if row and row[0]:
+                    name = str(row[0]).strip()
+                    break
+            except Exception:
+                continue
+    # ④ 基金：estimate_nav_data.fund_name
+    if not name and kind == "fund":
+        try:
+            row = db.conn.execute(
+                "SELECT fund_name FROM estimate_nav_data WHERE symbol = ? AND fund_name IS NOT NULL AND fund_name != '' LIMIT 1",
+                (symbol,)).fetchone()
+            if row and row[0]:
+                name = str(row[0]).strip()
+        except Exception:
+            pass
+    # ⑤ 兜底：subscriptions.name 解析（港股唯一来源）
+    if not name:
+        try:
+            rows = db.conn.execute(
+                "SELECT name FROM subscriptions WHERE symbol = ? AND name IS NOT NULL AND name != ''",
+                (symbol,)).fetchall()
+            for r in rows:
+                parsed = _parse_subscription_name(symbol, r[0])
+                if parsed:
+                    name = parsed
+                    break
+        except Exception:
+            pass
+    name = (name or symbol)[:40]
+    _NAME_CACHE[key] = name
+    return name
+
+
+def _days_since(datestr) -> Optional[int]:
+    """距今天数；解析不了返回 None。"""
+    if not datestr:
+        return None
+    raw = str(datestr)[:10].replace("/", "-")
+    try:
+        d = datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=TZ)
+    except ValueError:
+        return None
+    return (datetime.now(TZ) - d).days
+
+
+def _mk_stale(datestr, threshold: int) -> Dict[str, Any]:
+    days = _days_since(datestr)
+    return {
+        "latest": str(datestr)[:19].replace("T", " ") if datestr else None,
+        "stale": bool(days is None or days > threshold),
+        "stale_days": days,
+    }
+
+
+# ── L2 各类列表 ─────────────────────────────────────────────────────────────
+
+def _cat_indices() -> Dict[str, Any]:
+    """指数列表（14 个）。latest 用**去重后最后一根真实交易日**，不用表内 max(trade_date)
+    —— 因为上游在非交易日也写行、价格复用（见 indexbars 模块文档）。"""
+    out = {"key": "indices", "name": "指数行情", "items": [], "total": 0}
+    try:
+        codes = [r[0] for r in db.conn.execute(
+            "SELECT DISTINCT code FROM index_data WHERE code IS NOT NULL").fetchall()]
+    except Exception as e:
+        logger.error(f"指数清单读取失败: {type(e).__name__}: {e}")
+        codes = []
+    latest_real = None
+    for code in sorted(codes):
+        try:
+            rows = [dict(r) for r in db.conn.execute(
+                "SELECT trade_date, price, open, high, low, volume FROM index_data "
+                "WHERE code = ? ORDER BY trade_date ASC", (code,)).fetchall()]
+        except Exception:
+            continue
+        bars = fin_indicators.bars_from_index(rows)
+        if not bars:
+            continue
+        last = bars[-1]
+        prev_close = bars[-2]["close"] if len(bars) >= 2 else None
+        pct = round((last["close"] - prev_close) / prev_close * 100, 2) if prev_close else None
+        item = {
+            "symbol": code,
+            "name": _resolve_name(code, "index"),
+            "kind": "index",
+            "last": round(last["close"], 4),
+            "change_pct": pct,
+            "data_as_of": last["date"],
+            "bars": len(bars),
+        }
+        out["items"].append(item)
+        if latest_real is None or last["date"] > latest_real:
+            latest_real = last["date"]
+    out["total"] = len(out["items"])
+    out.update(_mk_stale(latest_real, _STALE_THRESHOLD["indices"]))
+    out["basis"] = "按 index_data 去重（剔周末 + 复用快照）后的最后一根"
+    return out
+
+
+def _holdings_entries() -> List[Dict[str, Any]]:
+    """持仓 = 数据库里真实有数据的标的：
+       股票 = price_data 里出现过的 symbol；
+       基金 = nav_data 里出现、且**最新净值在保留期内**（排除陈年残留）。
+    """
+    entries: List[Dict[str, Any]] = []
+    try:
+        for (sym,) in db.conn.execute(
+                "SELECT DISTINCT symbol FROM price_data WHERE symbol IS NOT NULL AND symbol != ''").fetchall():
+            entries.append({"symbol": sym, "kind": "stock"})
+    except Exception as e:
+        logger.error(f"股票清单读取失败: {type(e).__name__}: {e}")
+    try:
+        rows = db.conn.execute(
+            "SELECT symbol, max(nav_date) AS last FROM nav_data "
+            "WHERE symbol IS NOT NULL AND symbol != '' GROUP BY symbol").fetchall()
+        for sym, last in rows:
+            days = _days_since(last)
+            if days is None or days > _FUND_RETENTION_DAYS:
+                continue          # 陈年残留 → 排除
+            entries.append({"symbol": sym, "kind": "fund"})
+    except Exception as e:
+        logger.error(f"基金清单读取失败: {type(e).__name__}: {e}")
+    for e in entries:
+        e["name"] = _resolve_name(e["symbol"], e["kind"])
+    return entries
+
+
+def _cat_holdings() -> Dict[str, Any]:
+    """持仓列表：行情 + 指标（股票走 price 日K，基金走 nav 日K）。"""
+    out = {"key": "holdings", "name": "我的持仓", "items": [], "total": 0}
+    latest = None
+    for e in _holdings_entries():
+        q = _quote_of(e["symbol"], e["kind"])
+        ind = _indicators_of(e["symbol"], e["kind"])
+        stale_days = _stale_days(q["data_as_of"])
+        threshold = _STALE_THRESHOLD["holdings_stock" if e["kind"] == "stock" else "holdings_fund"]
+        out["items"].append({
+            "symbol": e["symbol"], "name": e["name"], "kind": e["kind"],
+            "last": q["last"], "change_pct": q["change_pct"], "estimated": q["estimated"],
+            "data_as_of": q["data_as_of"],
+            "stale_days": stale_days,
+            "stale": bool(stale_days is None or stale_days > threshold),
+            "ma5": ind["ma5"], "ma20": ind["ma20"], "rsi6": ind["rsi6"],
+            "macd_death_cross": ind["macd"]["death_cross"],
+            "macd_golden_cross": ind["macd"]["golden_cross"],
+            "at_20d_high": ind["at_20d_high"], "at_20d_low": ind["at_20d_low"],
+            "bias_ma5_pct": ind["bias_ma5_pct"],
+            "bars": ind["bars"], "insufficient": ind["insufficient"],
+        })
+        if q["data_as_of"] and (latest is None or q["data_as_of"] > latest):
+            latest = q["data_as_of"]
+    out["total"] = len(out["items"])
+    out.update(_mk_stale(latest, _STALE_THRESHOLD["holdings_stock"]))
+    return out
+
+
+def _cat_fundflow() -> Dict[str, Any]:
+    """资金流排行（个股主力净流入前 N）。"""
+    out = {"key": "fundflow", "name": "资金流排行", "items": [], "total": 0}
+    try:
+        total = db.conn.execute(
+            "SELECT count(DISTINCT symbol) FROM fund_flow_data WHERE flow_type = 'main_fund_rank'"
+        ).fetchone()[0]
+        rows = db.conn.execute(
+            "SELECT rank_no, symbol, name, price, change_pct, main_net_inflow, main_net_pct, collected_at "
+            "FROM fund_flow_data WHERE flow_type = 'main_fund_rank' "
+            "ORDER BY collected_at DESC, rank_no ASC LIMIT ?", (_LIST_CAP,)).fetchall()
+        latest = None
+        items = []
+        for r in rows:
+            items.append({
+                "symbol": r[1], "name": (r[2] or _resolve_name(r[1], "stock"))[:40], "kind": "stock",
+                "rank": r[0], "last": r[3], "change_pct": r[4],
+                "main_net_inflow": r[5], "main_net_pct": r[6],
+                "data_as_of": str(r[7])[:19].replace("T", " ") if r[7] else None,
+            })
+            if r[7] and (latest is None or str(r[7]) > latest):
+                latest = str(r[7])
+        out["items"] = items
+        out["total"] = int(total or 0)
+        out.update(_mk_stale(latest, _STALE_THRESHOLD["fundflow"]))
+        out["note"] = f"显示前 {len(items)} 条（共 {out['total']} 条）"
+    except Exception as e:
+        logger.error(f"资金流排行读取失败: {type(e).__name__}: {e}")
+        out.update(_mk_stale(None, _STALE_THRESHOLD["fundflow"]))
+    return out
+
+
+def _cat_dragon() -> Dict[str, Any]:
+    """龙虎榜（实测停更：最新 2026-07-02）。"""
+    out = {"key": "dragon", "name": "龙虎榜", "items": [], "total": 0}
+    try:
+        total = db.conn.execute("SELECT count(DISTINCT code) FROM dragon_tiger_data").fetchone()[0]
+        latest_row = db.conn.execute("SELECT max(trade_date) FROM dragon_tiger_data").fetchone()
+        latest = latest_row[0] if latest_row else None
+        rows = db.conn.execute(
+            "SELECT trade_date, code, name, close_price, change_pct, net_buy_amount "
+            "FROM dragon_tiger_data ORDER BY trade_date DESC, net_buy_amount DESC LIMIT ?",
+            (_LIST_CAP,)).fetchall()
+        out["items"] = [{
+            "symbol": r[1], "name": (r[2] or _resolve_name(r[1], "stock"))[:40], "kind": "stock",
+            "trade_date": str(r[0])[:10] if r[0] else None,
+            "last": r[3], "change_pct": r[4], "net_buy_amount": r[5],
+            "data_as_of": str(r[0])[:10] if r[0] else None,
+        } for r in rows]
+        out["total"] = int(total or 0)
+        out.update(_mk_stale(latest, _STALE_THRESHOLD["dragon"]))
+        out["note"] = f"显示前 {len(out['items'])} 条（共 {out['total']} 只）"
+    except Exception as e:
+        logger.error(f"龙虎榜读取失败: {type(e).__name__}: {e}")
+        out.update(_mk_stale(None, _STALE_THRESHOLD["dragon"]))
+    return out
+
+
+def _cat_limitup() -> Dict[str, Any]:
+    """涨停池（实测停更：最新 2026-07-01）。"""
+    out = {"key": "limitup", "name": "涨停池", "items": [], "total": 0}
+    try:
+        total = db.conn.execute("SELECT count(DISTINCT code) FROM limit_up_pool_data").fetchone()[0]
+        latest_row = db.conn.execute("SELECT max(trade_date) FROM limit_up_pool_data").fetchone()
+        latest = latest_row[0] if latest_row else None
+        rows = db.conn.execute(
+            "SELECT trade_date, code, name, price, change_pct, limit_times, amount "
+            "FROM limit_up_pool_data ORDER BY trade_date DESC, amount DESC LIMIT ?",
+            (_LIST_CAP,)).fetchall()
+        out["items"] = [{
+            "symbol": r[1], "name": (r[2] or _resolve_name(r[1], "stock"))[:40], "kind": "stock",
+            "last": r[3], "change_pct": r[4], "limit_times": r[5], "amount": r[6],
+            "data_as_of": str(r[0])[:10] if r[0] else None,
+        } for r in rows]
+        out["total"] = int(total or 0)
+        out.update(_mk_stale(latest, _STALE_THRESHOLD["limitup"]))
+        out["note"] = f"显示前 {len(out['items'])} 条（共 {out['total']} 只）"
+    except Exception as e:
+        logger.error(f"涨停池读取失败: {type(e).__name__}: {e}")
+        out.update(_mk_stale(None, _STALE_THRESHOLD["limitup"]))
+    return out
+
+
+def _cat_news() -> Dict[str, Any]:
+    """快讯（4 个中文源）。"""
+    block = _news_block()
+    out = {
+        "key": "news", "name": "快讯",
+        "items": block["items"], "total": block["total"],
+        "sources": block["sources"], "collected_at": block.get("collected_at"),
+    }
+    out.update(_mk_stale(block.get("collected_at"), _STALE_THRESHOLD["news"]))
+    return out
+
+
+_CATALOG_BUILDERS = {
+    "indices": _cat_indices,
+    "holdings": _cat_holdings,
+    "fundflow": _cat_fundflow,
+    "dragon": _cat_dragon,
+    "limitup": _cat_limitup,
+    "news": _cat_news,
+}
+_CATALOG_ORDER = ("indices", "holdings", "fundflow", "dragon", "limitup", "news")
+
+
+_CAT_CACHE: Dict[str, Any] = {"stamp": None, "at": 0.0, "payload": None}
+_CAT_TTL_SECONDS = 60
+
+
+def _catalog_stamp() -> Any:
+    """L1 的失效 stamp：各类别 count + 最新时间。任何一类有变化就重算。"""
+    parts = []
+    for cat in _CATALOG_ORDER:
+        try:
+            if cat == "indices":
+                row = db.conn.execute("SELECT count(DISTINCT code), max(trade_date) FROM index_data").fetchone()
+            elif cat == "holdings":
+                a = db.conn.execute("SELECT count(DISTINCT symbol), max(trade_time) FROM price_data").fetchone()
+                b = db.conn.execute("SELECT count(DISTINCT symbol), max(nav_date) FROM nav_data").fetchone()
+                row = (a[0] + b[0], max(str(a[1] or ""), str(b[1] or "")))
+            elif cat == "fundflow":
+                row = db.conn.execute("SELECT count(DISTINCT symbol), max(collected_at) FROM fund_flow_data").fetchone()
+            elif cat == "dragon":
+                row = db.conn.execute("SELECT count(DISTINCT code), max(trade_date) FROM dragon_tiger_data").fetchone()
+            elif cat == "limitup":
+                row = db.conn.execute("SELECT count(DISTINCT code), max(trade_date) FROM limit_up_pool_data").fetchone()
+            else:
+                row = db.conn.execute("SELECT count(*), max(ingested_at) FROM news_aggregator_data").fetchone()
+            parts.append((cat, row[0], str(row[1] or "")))
+        except Exception:
+            parts.append((cat, None, ""))
+    return tuple(parts)
+
+
+@app.get("/api/v1/catalog")
+async def get_catalog():
+    """L1：六个数据类别的元信息（计数 + 新鲜度）。**不含列表内容**，极轻。"""
+    global _CAT_CACHE
+    try:
+        stamp = _catalog_stamp()
+        now = time.time()
+        if (_CAT_CACHE["payload"] is not None and _CAT_CACHE["stamp"] == stamp
+                and (now - _CAT_CACHE["at"]) < _CAT_TTL_SECONDS):
+            payload = dict(_CAT_CACHE["payload"])
+            payload["cached"] = True
+            payload["cache_age_sec"] = round(now - _CAT_CACHE["at"], 1)
+            return payload
+
+        cats = []
+        for cat in _CATALOG_ORDER:
+            try:
+                block = _CATALOG_BUILDERS[cat]()
+            except Exception as e:
+                logger.error(f"类别 {cat} 构建失败: {type(e).__name__}: {e}")
+                block = {"key": cat, "name": cat, "total": 0, "latest": None,
+                         "stale": True, "stale_days": None, "items": []}
+            cats.append({
+                "key": block["key"], "name": block["name"],
+                "count": block.get("total", 0),
+                "latest": block.get("latest"),
+                "stale": block.get("stale", True),
+                "stale_days": block.get("stale_days"),
+            })
+        payload = {
+            "as_of": datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
+            "categories": cats,
+            "cached": False, "cache_age_sec": 0,
+        }
+        _CAT_CACHE = {"stamp": stamp, "at": now, "payload": payload}
+        return payload
+    except Exception as e:
+        logger.exception(f"目录聚合失败: {e}")
+        raise HTTPException(500, "目录聚合失败")
+
+
+@app.get("/api/v1/catalog/{cat}")
+async def get_catalog_category(cat: str):
+    """L2：某一类别的列表（大列表截前 50，返回 total）。"""
+    if cat not in _CATALOG_BUILDERS:
+        raise HTTPException(404, f"未知类别 {cat!r}；可用：{', '.join(_CATALOG_ORDER)}")
+    try:
+        block = _CATALOG_BUILDERS[cat]()
+        block["as_of"] = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+        return block
+    except Exception as e:
+        logger.exception(f"类别 {cat} 失败: {e}")
+        raise HTTPException(500, f"类别 {cat} 读取失败")
+
+
+@app.get("/api/v1/detail")
+async def get_detail(symbol: str = Query(..., description="标的代码（来自列表，用户不手输）")):
+    """L3：单标的详情。**自动识别品种**：price_data→股票 / nav_data→基金 / index_data→指数。
+
+    指数与基金都会走各自的 bars 适配器算指标（见 fin_indicators 对应模块）。
+    """
+    sym = (symbol or "").strip()
+    if not _SYMBOL_RE_DASH.match(sym):
+        raise HTTPException(422, "symbol 格式非法")
+    try:
+        # ① 识别品种（按数据存在性，优先级：指数 > 股票 > 基金）
+        kind = None
+        try:
+            if db.conn.execute("SELECT 1 FROM index_data WHERE code = ? LIMIT 1", (sym,)).fetchone():
+                kind = "index"
+        except Exception:
+            pass
+        if kind is None:
+            try:
+                if db.conn.execute("SELECT 1 FROM price_data WHERE symbol = ? LIMIT 1", (sym,)).fetchone():
+                    kind = "stock"
+            except Exception:
+                pass
+        if kind is None:
+            try:
+                if db.conn.execute("SELECT 1 FROM nav_data WHERE symbol = ? LIMIT 1", (sym,)).fetchone():
+                    kind = "fund"
+            except Exception:
+                pass
+        if kind is None:
+            raise HTTPException(404, f"库里没有 {sym} 的数据")
+
+        name = _resolve_name(sym, kind)
+        quote = _quote_of(sym, kind) if kind != "index" else None
+        ind = _indicators_of(sym, kind)
+
+        # 指数：quote 用去重后的 bars 末值（与指标同源，避免两处口径不同）
+        if kind == "index":
+            rows = [dict(r) for r in db.conn.execute(
+                "SELECT trade_date, price, open, high, low, volume FROM index_data "
+                "WHERE code = ? ORDER BY trade_date ASC", (sym,)).fetchall()]
+            bars = fin_indicators.bars_from_index(rows)
+            if bars:
+                last = bars[-1]
+                prev = bars[-2]["close"] if len(bars) >= 2 else None
+                quote = {
+                    "last": round(last["close"], 4),
+                    "change_pct": round((last["close"] - prev) / prev * 100, 2) if prev else None,
+                    "data_as_of": last["date"],
+                    "estimated": False,
+                }
+            else:
+                quote = {"last": None, "change_pct": None, "data_as_of": None, "estimated": False}
+
+        threshold = {"stock": _STALE_THRESHOLD["holdings_stock"],
+                     "fund": _STALE_THRESHOLD["holdings_fund"],
+                     "index": _STALE_THRESHOLD["indices"]}[kind]
+        stale_days = _stale_days(quote.get("data_as_of"))
+
+        # 该标的的新闻（只有个股新闻表覆盖到的才有）
+        news_items = []
+        try:
+            rows = db.conn.execute(
+                "SELECT source, title, link, published FROM news_data WHERE symbol = ? "
+                "ORDER BY published DESC LIMIT 10", (sym,)).fetchall()
+            for r in rows:
+                ts = _norm_news_ts(r[3])
+                if not ts or not r[1]:
+                    continue
+                news_items.append({"ts": ts, "source": r[0], "title": str(r[1])[:160],
+                                   "url": r[2]})
+        except Exception:
+            pass
+
+        ann = []
+        try:
+            rows = db.conn.execute(
+                "SELECT source, title, announcement_time, link FROM announcement_data "
+                "WHERE symbol = ? ORDER BY announcement_time DESC LIMIT 10", (sym,)).fetchall()
+            ann = [{"source": r[0], "title": str(r[1])[:160],
+                    "ts": _norm_news_ts(r[2]), "url": r[3]} for r in rows]
+        except Exception:
+            pass
+
+        return {
+            "symbol": sym, "name": name, "kind": kind,
+            "quote": quote,
+            "stale": bool(stale_days is None or stale_days > threshold),
+            "stale_days": stale_days,
+            "indicators": ind,
+            "news": news_items,
+            "announcements": ann,
+            "as_of": datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"详情读取失败 {sym}: {e}")
+        raise HTTPException(500, "详情读取失败")
 
 
 @app.get("/api/v1/stats")

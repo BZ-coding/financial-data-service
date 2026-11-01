@@ -30,7 +30,12 @@ from market_service.api import app  # noqa: E402
 client = TestClient(app)
 
 STOCK_SYMBOLS = {"002202", "hk03690", "hk09988"}
-FUND_SYMBOLS = {"008114", "018824", "014086", "015716", "011612"}
+# 2026-11-01 起：清单改为**数据库真实数据**（不再读 watchlist.json）
+# 基金 = nav_data 里最新净值在 30 天内（排除陈年残留）
+FUND_SYMBOLS = {"008114", "011612", "014086", "015716", "018824",
+                "023895", "024450", "163807", "270023"}
+# 陈年残留（最新净值远超 30 天）—— 必须被排除
+JUNK_FUNDS = {"000001", "270002", "110011", "161725"}
 
 
 @pytest.fixture(scope="module")
@@ -45,17 +50,20 @@ def test_top_level_structure(dash):
     for k in ("as_of", "watchlist_size", "quotes", "indicators", "news", "health",
               "cached", "cache_age_sec"):
         assert k in dash, f"缺字段 {k}"
-    assert dash["watchlist_size"] == 8, dash["watchlist_size"]
-    assert len(dash["quotes"]) == 8
-    assert len(dash["indicators"]) == 8
+    # 数量按库实查（3 股票 + 9 基金 = 12），不再硬编码 8
+    assert dash["watchlist_size"] == len(dash["quotes"]) == len(dash["indicators"])
+    assert dash["watchlist_size"] >= 12, dash["watchlist_size"]
 
 
-def test_watchlist_symbols(dash):
+def test_holdings_symbols(dash):
+    """清单来自**数据库真实数据**：3 股票 + 9 基金；4 只陈年残留必须被排除。"""
     syms = {q["symbol"] for q in dash["quotes"]}
-    assert syms == STOCK_SYMBOLS | FUND_SYMBOLS, syms
-    # SGXZ99103178（货币基金，库中零数据）按决策**不放进清单**
-    assert "SGXZ99103178" not in syms
-    # 名字必须来自配置（market.db 里没有可靠标的名）
+    assert STOCK_SYMBOLS <= syms, f"缺股票: {STOCK_SYMBOLS - syms}"
+    assert FUND_SYMBOLS <= syms, f"缺基金: {FUND_SYMBOLS - syms}"
+    missing = JUNK_FUNDS & syms
+    assert not missing, f"陈年残留基金未被排除: {missing}"
+    assert "SGXZ99103178" not in syms          # 库里零数据
+    # 名字必须解析出来（库里多级回退；港股靠解析 subscriptions.name）
     for q in dash["quotes"]:
         assert q["name"] and q["name"] != q["symbol"], q
 
