@@ -1648,6 +1648,8 @@ def _cat_fundflow(limit: int = None, offset: int = 0, sort: str = None) -> Dict[
             order = "main_net_inflow DESC"
         elif sort == "change_pct":
             order = "change_pct DESC"
+        elif sort == "symbol":      # 按代码排序（批评家阻塞 1：前端按钮有真实价值，后端漏实现）
+            order = "symbol ASC"
         if limit is None:
             limit = _LIST_CAP
         limit = max(1, min(int(limit), 1000))
