@@ -317,6 +317,8 @@ class CommunityEnhancedCollector(BaseCollector):
     def _fetch_main_fund_rank(self, top_n: int = 20, timeout: int = 5, max_retries: int = 3) -> Optional[List[Dict[str, Any]]]:
         """
         主力资金净流入 Top N (东方财富 push2delay 接口, mcp-eastmoney 同源)
+        2026-11-03 扩容（项 ④）：上游单页上限 pz=100（实测 pz>100 仍返 100），
+        top_n>100 自动 pn 翻页（每页间隔 2s 限速）；5563 条全量可分 56 页拉齐。
         fields: f12=code, f14=name, f2=price, f3=change_pct×100,
                 f62=main_net_inflow(元), f184=main_net_pct×100,
                 f66=super_large, f70=large, f76=medium, f78=small
@@ -331,18 +333,33 @@ class CommunityEnhancedCollector(BaseCollector):
         try:
             import time as _time
             fs = "m:0+t:6,m:0+t:13,m:0+t:80,m:1+t:2,m:1+t:23,m:1+t:8"
-            ts = int(_time.time() * 1000)
-            # 用 push2delay (mcp-eastmoney 同款), push2 经常被封
-            url = (
-                f"https://push2delay.eastmoney.com/api/qt/clist/get"
-                f"?pn=1&pz={top_n}&po=1&np=1&fltt=2&invt=2"
-                f"&fid=f62&fs={fs}"
-                f"&fields=f12,f14,f2,f3,f62,f184,f66,f70,f76,f78"
-                f"&req_trace={ts}&_={ts}"
-            )
-            resp = self._get_with_backoff(url, headers={"Referer": "https://quote.eastmoney.com/"}, timeout=timeout, max_retries=max_retries)
-            data = resp.json()
-            diff = (data.get("data") or {}).get("diff") or []
+            # 单页上限 100（实测 pz=100/300/500 都只返 100）→ top_n>100 分页翻
+            pages = max(1, -(-top_n // 100))
+            pz = min(top_n, 100)
+            diff = []
+            upstream_total = None
+            for pn in range(1, pages + 1):
+                ts = int(_time.time() * 1000)
+                url = (
+                    f"https://push2delay.eastmoney.com/api/qt/clist/get"
+                    f"?pn={pn}&pz={pz}&po=1&np=1&fltt=2&invt=2"
+                    f"&fid=f62&fs={fs}"
+                    f"&fields=f12,f14,f2,f3,f62,f184,f66,f70,f76,f78"
+                    f"&req_trace={ts}&_={ts}"
+                )
+                resp = self._get_with_backoff(url, headers={"Referer": "https://quote.eastmoney.com/"}, timeout=timeout, max_retries=max_retries)
+                data = resp.json()
+                d = (data.get("data") or {})
+                batch = d.get("diff") or []
+                if upstream_total is None:
+                    upstream_total = d.get("data", {}).get("total")
+                diff.extend(batch)
+                if len(batch) < pz:
+                    break                      # 最后一页
+                if pn < pages:
+                    _time.sleep(2)             # 限速节奏（上游限流敏感）
+            self.logger.info(f"_fetch_main_fund_rank 获取 {len(diff)} 条"
+                             f"（{pages} 页，上游 total={upstream_total}）")
             items = []
             for i, r in enumerate(diff, start=1):
                 # f2=价格(元), f3=涨跌幅×100(%), f62=主力净流入(元), f184=主力净流入占比×100(%)
