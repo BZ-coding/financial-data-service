@@ -1048,7 +1048,13 @@ def _quote_of(symbol: str, kind: str) -> Dict[str, Any]:
                 out["change_pct"] = round(float(fr[1]) * 100, 2) if fr[1] is not None else None
                 out["main_net_inflow"] = float(fr[2]) if fr[2] is not None else None
                 out["main_net_pct"] = float(fr[3]) if fr[3] is not None else None
-                out["data_as_of"] = str(fr[4])[:19].replace("T", " ") if fr[4] else None
+                # ⚠️ fund_flow_data.collected_at 是 DEFAULT CURRENT_TIMESTAMP（UTC），
+                #   必须转本地——与 L2 资金流列表 items[].data_as_of 同一口径。
+                #   不转会让详情页比看板列表早 8 小时（同一张卡两个时区）。
+                #   （本函数另外两处时间不能转：market_time 是行情时间、已是本地；
+                #     estimate_time 来自上游行情、也是本地，见 estimate_nav_data
+                #     的 estimate_time(03:11 本地) vs ingested_at(19:12 UTC)。）
+                out["data_as_of"] = _utc_to_local(fr[4]) if fr[4] else None
             return out
         if row:
             last = row.get("price")
