@@ -107,6 +107,12 @@ def main():
     #    现在改为：开头 dry_run=True 只统计 → 打印 → 确认真删模式时
     #    【先备份、再一次性真删】，表格里的数字只是统计，与删除动作分离。
     if args.apply:
+        logger = logging.getLogger("market-cleanup")
+        if not logger.handlers:
+            _h = logging.StreamHandler()
+            _h.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+            logger.addHandler(_h)
+            logger.setLevel(logging.INFO)
         # 备份 collection_log（最大的表）—— 必须在**删除之前**
         bak_dir = db_path.parent / "backups"
         bak_dir.mkdir(parents=True, exist_ok=True)
@@ -122,6 +128,17 @@ def main():
 
         # 一次性真删（内部对每张表仍是 COUNT → expect_rows 精确护栏 → DELETE）
         result = db.cleanup_old_data(ret, dry_run=False)
+        # 审计：删除前后行数 + 各表实际删除数 + cutoff（批评家：删数据的操作必须有可审计记录）
+        import logging
+        _cl = logging.getLogger("market.cleanup")
+        if not _cl.handlers:
+            _ch = logging.StreamHandler()
+            _ch.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+            _cl.addHandler(_ch)
+            _cl.setLevel(logging.INFO)
+        _cl.info("清理审计: 删除前库大小=%.1fMB 删除后库大小=%.1fMB "
+                 "cutoff配置=%s 实际删除=%s 合计=%d行",
+                 before, db_size_mb(db_path), ret, result["deleted"], total)
         print(f"\n→ 删除完成: {result['deleted']}")
     else:
         print("→ （未进入真删模式）")
