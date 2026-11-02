@@ -1647,8 +1647,8 @@ def _cat_fundflow(limit: int = None, offset: int = 0, sort: str = None) -> Dict[
         # 是欺骗性 UI，不能让前端拿到这种 total。
         total = db.conn.execute(
             "SELECT COUNT(*) FROM fund_flow_data WHERE flow_type='main_fund_rank'"
-            " AND collected_at=(SELECT max(collected_at) FROM fund_flow_data"
-            "                   WHERE flow_type='main_fund_rank')"
+            " AND collected_at >= (SELECT datetime(max(collected_at),'-5 minutes')"
+            "   FROM fund_flow_data WHERE flow_type='main_fund_rank')"
         ).fetchone()[0]
         out["total_history"] = int(db.conn.execute(
             "SELECT count(DISTINCT symbol) FROM fund_flow_data"
@@ -1663,6 +1663,8 @@ def _cat_fundflow(limit: int = None, offset: int = 0, sort: str = None) -> Dict[
         if latest_ts is None:
             out["note"] = "暂无数据"
             return out
+        _win = (datetime.fromisoformat(latest_ts) - timedelta(minutes=5)) \
+            .strftime("%Y-%m-%d %H:%M:%S")
         order = "rank_no ASC"   # 默认：官方榜rank
         if sort == "inflow":
             order = "main_net_inflow DESC"
@@ -1676,7 +1678,7 @@ def _cat_fundflow(limit: int = None, offset: int = 0, sort: str = None) -> Dict[
         offset = max(0, int(offset))
         rows = db.conn.execute(
             f"SELECT rank_no, symbol, name, price, change_pct, main_net_inflow, main_net_pct, collected_at "
-            f"FROM fund_flow_data WHERE flow_type = 'main_fund_rank' AND collected_at = ? "
+            f"FROM fund_flow_data WHERE flow_type = 'main_fund_rank' AND collected_at >= ? "
             f"ORDER BY {order} LIMIT ? OFFSET ?", (latest_ts, limit, offset)).fetchall()
         latest = None
         items = []
