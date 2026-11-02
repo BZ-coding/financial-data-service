@@ -1685,7 +1685,7 @@ def _cat_fundflow(limit: int = None, offset: int = 0, sort: str = None) -> Dict[
                 "symbol": r[1], "name": (r[2] or _resolve_name(r[1], "stock"))[:40], "kind": "stock",
                 "rank": r[0], "last": r[3], "change_pct": r[4],
                 "main_net_inflow": r[5], "main_net_pct": r[6],
-                "data_as_of": str(r[7])[:19].replace("T", " ") if r[7] else None,
+                "data_as_of": _utc_to_local(r[7]) if r[7] else None,
             })
             if r[7] and (latest is None or str(r[7]) > latest):
                 latest = str(r[7])
