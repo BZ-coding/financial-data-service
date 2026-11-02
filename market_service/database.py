@@ -1307,6 +1307,10 @@ class Database:
         ("estimate_nav_data",   "ingested_at", "estimate_nav_days",  30, "盘中估算净值"),
         ("news_aggregator_data","ingested_at", "aggregator_days",    14, "全网聚合新闻（单行可达 30KB）"),
         ("mmx_search_data",     "collected_at","mmx_search_days",    90, "财经搜索结果（长期无消费）"),
+        # 2026-11-03（项 ⑥）：fund_flow_data 原来不在保留列表——top_n 扩容后
+        # 300 个股 + 992 板块 × ~6 批/日 ≈ 7750 行/天 ≈ 550MB/年，无限增长。
+        # 90 天与前值分析窗口匹配；更早的批次只对历史回测有用。
+        ("fund_flow_data",      "collected_at","fund_flow_days",     90, "资金流（个股+板块，top_n 扩容后 ~7750 行/日）"),
     ]
 
     def cleanup_old_data(self, retention_days: Dict[str, int], dry_run: bool = False) -> Dict[str, Any]:

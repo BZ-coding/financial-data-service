@@ -46,6 +46,10 @@ from market_service.database import Database, TZ  # noqa: E402
 DEFAULT_RETENTION = {
     "log_days": 30, "price_days": 90, "news_days": 30, "minute_days": 60,
     "estimate_nav_days": 30, "aggregator_days": 14, "mmx_search_days": 90,
+    # 2026-11-03（项 ⑥）：fund_flow_data 原来不在保留列表——top_n 扩容后
+    # 300 个股 + 992 板块 × ~6 批/日 ≈ 7750 行/天 ≈ 550MB/年，无限增长。
+    # 90 天与前值分析窗口匹配；更早的批次只对历史回测有用。
+    "fund_flow_days": 90,
 }
 
 
