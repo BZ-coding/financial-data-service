@@ -391,21 +391,32 @@ class CommunityEnhancedCollector(BaseCollector):
         fields: f12=code, f14=name, f3=change_pct×100,
                 f62=main_net_inflow(元), f184=main_net_pct×100,
                 f128=leading_stock, f136=leading_change_pct×100
+        2026-11-03 扩容（与 main_fund_rank 同模式）：top_n>100 自动 pn 翻页，
+        上游 total：行业 496 / 概念 531，全量可拉。
         """
         try:
             import time as _time
             fs = "m:90+t:2" if kind == "industry" else "m:90+t:3"
-            ts = int(_time.time() * 1000)
-            url = (
-                f"https://push2delay.eastmoney.com/api/qt/clist/get"
-                f"?pn=1&pz={top_n}&po=1&np=1&fltt=2&invt=2"
-                f"&fid=f62&fs={fs}"
-                f"&fields=f12,f14,f2,f3,f62,f184,f128,f136"
-                f"&req_trace={ts}&_={ts}"
-            )
-            resp = self._get_with_backoff(url, headers={"Referer": "https://quote.eastmoney.com/"}, timeout=timeout, max_retries=max_retries)
-            data = resp.json()
-            diff = (data.get("data") or {}).get("diff") or []
+            pages = max(1, -(-top_n // 100))
+            pz = min(top_n, 100)
+            diff = []
+            for pn in range(1, pages + 1):
+                ts = int(_time.time() * 1000)
+                url = (
+                    f"https://push2delay.eastmoney.com/api/qt/clist/get"
+                    f"?pn={pn}&pz={pz}&po=1&np=1&fltt=2&invt=2"
+                    f"&fid=f62&fs={fs}"
+                    f"&fields=f12,f14,f2,f3,f62,f184,f128,f136"
+                    f"&req_trace={ts}&_={ts}"
+                )
+                resp = self._get_with_backoff(url, headers={"Referer": "https://quote.eastmoney.com/"}, timeout=timeout, max_retries=max_retries)
+                data = resp.json()
+                batch = (data.get("data") or {}).get("diff") or []
+                diff.extend(batch)
+                if len(batch) < pz:
+                    break
+                if pn < pages:
+                    _time.sleep(2)
             items = []
             for i, r in enumerate(diff, start=1):
                 items.append({
