@@ -889,7 +889,9 @@ class Database:
             return False
 
     def insert_fund_flow(self, data: Dict[str, Any]) -> bool:
-        """插入主力资金/板块资金流数据"""
+        """插入主力资金/板块资金流数据（INSERT OR REPLACE：同 rank_data 重采集时
+        UPDATE 值而不是静默跳过——原来 OR IGNORE 导致 496 条采集全部被静默吞掉，
+        collection_log 谎报 items_stored=496，表里一行都没有）"""
         try:
             # 解析 "12.34亿" 格式的字符串为浮点 (单位元)
             def parse_amount(s):
@@ -904,7 +906,7 @@ class Database:
                 except: return None
 
             self.conn.execute("""
-                INSERT OR IGNORE INTO fund_flow_data (
+                INSERT OR REPLACE INTO fund_flow_data (
                     source, flow_type, sector_kind, rank_no,
                     symbol, name, price, change_pct,
                     main_net_inflow, main_net_pct,
