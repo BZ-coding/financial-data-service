@@ -1693,6 +1693,8 @@ def _cat_fundflow(limit: int = None, offset: int = 0, sort: str = None) -> Dict[
                 latest = str(r[7])
         out["items"] = items
         out["total"] = int(total or 0)
+        # latest 来自 collected_at（UTC）→ 转本地
+        latest = _utc_to_local(latest) if latest else latest
         out.update(_mk_stale(latest, _STALE_THRESHOLD["fundflow"]))
         out["note"] = (f"第 {offset + 1}-{offset + len(items)} 条（本批共 {out['total']} 条）"
                        if limit is not None else f"显示前 {len(items)} 条（本批共 {out['total']} 条）")
@@ -1761,7 +1763,8 @@ def _cat_news() -> Dict[str, Any]:
         "items": block["items"], "total": block["total"],
         "sources": block["sources"], "collected_at": block.get("collected_at"),
     }
-    out.update(_mk_stale(block.get("collected_at"), _STALE_THRESHOLD["news"]))
+    _news_ts = _utc_to_local(block.get("collected_at", "")) if block.get("collected_at") else None
+    out.update(_mk_stale(_news_ts, _STALE_THRESHOLD["news"]))
     return out
 
 
@@ -1846,10 +1849,7 @@ async def get_catalog():
                 # latest 时区口径（2026-11-03 修）：
                 #   UTC 列（CURRENT_TIMESTAMP）→ 需转本地：fundflow（collected_at）、news（ingested_at）
                 #   日期型（DATE）或应用层本地 → 不转：indices/holdings/dragon/limitup
-                "latest": (_utc_to_local(block["latest"])
-                           if block["key"] == "fundflow"
-                           else block["latest"])
-                          if block.get("latest") else block.get("latest"),
+                "latest": block.get("latest"),
                 "stale": block.get("stale", True),
                 "stale_days": block.get("stale_days"),
                 "batch_as_of": block.get("batch_as_of"),
