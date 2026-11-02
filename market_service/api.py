@@ -1679,7 +1679,7 @@ def _cat_fundflow(limit: int = None, offset: int = 0, sort: str = None) -> Dict[
         rows = db.conn.execute(
             f"SELECT rank_no, symbol, name, price, change_pct, main_net_inflow, main_net_pct, collected_at "
             f"FROM fund_flow_data WHERE flow_type = 'main_fund_rank' AND collected_at >= ? "
-            f"ORDER BY {order} LIMIT ? OFFSET ?", (latest_ts, limit, offset)).fetchall()
+            f"ORDER BY {order} LIMIT ? OFFSET ?", (_win, limit, offset)).fetchall()
         latest = None
         items = []
         for r in rows:
@@ -1843,7 +1843,7 @@ async def get_catalog():
                 # （20），历史累计另放 total_history；其余类别口径不变。
                 "count": block.get("total", 0),
                 "unit": "条" if block["key"] == "news" else "个",
-                "latest": block.get("latest"),
+                "latest": _utc_to_local(block.get("latest", "")) if block.get("latest") else block.get("latest"),
                 "stale": block.get("stale", True),
                 "stale_days": block.get("stale_days"),
                 "batch_as_of": block.get("batch_as_of"),

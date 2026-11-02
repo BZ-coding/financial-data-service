@@ -77,11 +77,22 @@ def main() -> int:
             if not hits:
                 gaps.append(f"{sym}({kind}) 缺 {dt} 的 enabled 订阅")
                 continue
-            fresh = [s for s in hits
-                     if s["last_collected"]
-                     and datetime.now() - datetime.strptime(str(s["last_collected"])[:19],
-                                                            "%Y-%m-%d %H:%M:%S")
-                     < timedelta(hours=STALE_HOURS)]
+            # 盲区修复（批评家）：scheduler 失败时也更新 last_collected，
+            # 所以「订阅在跑但一直失败」检不出来。改查 collection_log 里
+            # 该 (symbol, data_type) 最近一次 status='success' 的时间。
+            fresh = []
+            for sub in hits:
+                sub_id = sub.get("id")
+                if sub_id is None:
+                    continue
+                ok_row = con.execute(
+                    "SELECT MAX(started_at) FROM collection_log"
+                    " WHERE subscription_id = ? AND status = 'success'",
+                    (sub_id,)).fetchone()
+                if ok_row and ok_row[0]:
+                    last_ok = datetime.fromisoformat(str(ok_row[0])[:19])
+                    if datetime.now() - last_ok < timedelta(hours=STALE_HOURS):
+                        fresh.append(sub)
             if not fresh:
                 last = max(str(s["last_collected"]) for s in hits)
                 gaps.append(f"{sym}({kind}) {dt} 订阅存在但超过 {STALE_HOURS}h 未采集"

@@ -349,12 +349,18 @@ class CommunityEnhancedCollector(BaseCollector):
                 )
                 resp = self._get_with_backoff(url, headers={"Referer": "https://quote.eastmoney.com/"}, timeout=timeout, max_retries=max_retries)
                 data = resp.json()
-                d = (data.get("data") or {})
-                batch = d.get("diff") or []
+                d = data.get("data")   # ⚠️ 上游限流时 data=None（HTTP 200 + null）
+                if d is None or not d.get("diff"):
+                    # P3：HTTP 200 但 data=null = 上游限流半批返回
+                    # → 已拿到的部分当失败（return None），不能当"最后一页"入库
+                    self.logger.warning(
+                        f"_fetch_main_fund_rank 第 {pn} 页 data=None（上游限流），"
+                        f"已拿 {len(diff)} 条 → 判为失败")
+                    return None
                 if upstream_total is None:
-                    upstream_total = d.get("data", {}).get("total")
-                diff.extend(batch)
-                if len(batch) < pz:
+                    upstream_total = d.get("total")   # ⚠️ 在 d 层取，不是 data 层
+                diff.extend(d.get("diff") or [])
+                if len(d.get("diff") or []) < pz:
                     break                      # 最后一页
                 if pn < pages:
                     _time.sleep(2)             # 限速节奏（上游限流敏感）
@@ -411,7 +417,12 @@ class CommunityEnhancedCollector(BaseCollector):
                 )
                 resp = self._get_with_backoff(url, headers={"Referer": "https://quote.eastmoney.com/"}, timeout=timeout, max_retries=max_retries)
                 data = resp.json()
-                batch = (data.get("data") or {}).get("diff") or []
+                d = data.get("data")
+                if d is None or not d.get("diff"):
+                    self.logger.warning(
+                        f"_fetch_sector_fund_flow({kind}) 第 {pn} 页 data=None（上游限流）")
+                    return None
+                batch = d.get("diff") or []
                 diff.extend(batch)
                 if len(batch) < pz:
                     break

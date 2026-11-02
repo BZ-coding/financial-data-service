@@ -1325,7 +1325,7 @@ class Database:
         Returns:
             {"deleted": {表名: 行数}, "cutoffs": {表名: 截止时间}, "dry_run": bool}
         """
-        now = datetime.now(TZ)
+        now = datetime.now(timezone.utc)  # P0: cutoff 用 UTC（collected_at 存 UTC，本地 cutoff 多删 8h 窗口）
         deleted_counts = {}
         cutoffs = {}
 
