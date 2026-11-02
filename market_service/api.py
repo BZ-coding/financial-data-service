@@ -1763,8 +1763,10 @@ def _cat_news() -> Dict[str, Any]:
         "items": block["items"], "total": block["total"],
         "sources": block["sources"], "collected_at": block.get("collected_at"),
     }
-    _news_ts = _utc_to_local(block.get("collected_at", "")) if block.get("collected_at") else None
-    out.update(_mk_stale(_news_ts, _STALE_THRESHOLD["news"]))
+    # ⚠️ _news_block 已把 collected_at 从 UTC 转成本地时间（带 +08:00 后缀）
+    #    这里不能再转（双重转换会把 00:49 变 08:49）
+    _news_ts = block.get("collected_at", "")
+    out.update(_mk_stale(str(_news_ts)[:19] if _news_ts else None, _STALE_THRESHOLD["news"]))
     return out
 
 
