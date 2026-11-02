@@ -1854,18 +1854,21 @@ async def get_sectors(
                 " FROM fund_flow_data WHERE flow_type='sector_fund_flow' AND sector_kind=?"
                 " AND collected_at=? ORDER BY main_net_inflow DESC LIMIT ?",
                 (k, latest_ts, lim)).fetchall()
-            # 领涨股名字 → 代码（一次查出本批全部名字，避免 N+1）
+            # 领涨股名字 → 代码：只有一级反查（fund_flow_data 历史全量）。
+            # 勘查实测最新批命中率 2/9——领涨股不一定在 top20 资金流榜里；
+            # 库内没有第二来源（price_data 无 name 列，daily_data 等亦无），查不到就 None，
+            # 前端按"领涨股名字可显示、代码不可点"容错。根修是采集器回填 stock_basic_data，
+            # 已报 Chief 另派，不在本卡范围。
             names = [r[6] for r in rows if r[6]]
             code_map: Dict[str, str] = {}
             if names:
                 ph = ",".join("?" * len(names))
                 try:
                     for r2 in db.conn.execute(
-                        f"SELECT name, symbol FROM fund_flow_data WHERE flow_type='main_fund_rank'"
-                        f" AND name IN ({ph}) AND collected_at="
-                        f"(SELECT max(collected_at) FROM fund_flow_data WHERE flow_type='main_fund_rank')",
-                        names).fetchall():
-                        code_map.setdefault(r2[0], r2[1])
+                        f"SELECT name, symbol, max(collected_at) FROM fund_flow_data"
+                        f" WHERE flow_type='main_fund_rank' AND name IN ({ph})"
+                        f" GROUP BY name", names).fetchall():
+                        code_map[r2[0]] = r2[1]
                 except Exception:
                     pass
             items = []
