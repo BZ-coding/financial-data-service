@@ -12,6 +12,15 @@ import json
 import asyncio
 import re
 import requests
+# ── IPv6 出口修复（2026-11-03 运维手定位）─────────────────────────────────
+# 根因：push2/push2delay/push2his 的 AAAA 指向 Azure Traffic Manager 边缘，
+# 从本机走 IPv6 全部 SSL EOF（IPv4 同域名 200 稳定）；urllib3 按 getaddrinfo
+# 顺序优先 IPv6 → 55 连败、12 小时断更。运维手实测 HAS_IPV6=False 后
+# 三个域全部 200。这里在**模块加载时**统一关闭 urllib3 的 IPv6 依赖——
+# 采集器所有 requests 调用都经过本模块，一处生效。
+# （不用 /etc/gai.conf 系统级改优先——那影响全机服务，运维侧明确不建议。）
+import urllib3.util.connection as _u3conn
+_u3conn.HAS_IPV6 = False
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone, timedelta
 import logging
