@@ -1433,6 +1433,26 @@ def _parse_subscription_name(symbol: str, name: str) -> Optional[str]:
     return s
 
 
+def _utc_to_local(ts: str) -> str:
+    """DB 时间字段（UTC）→ 本地时间字符串（Asia/Shanghai）。
+
+    ⚠️ 库里 collected_at 存的是 UTC（CURRENT_TIMESTAMP 默认），但这个系统
+    只服务一个时区——在 API 输出边界转一次比在 N 个前端位置转更可靠。
+    前端不做时区换算，直接显示。
+    （2026-11-03 用户报告：看板显示 17:43 实际是本地 01:43，差 8 小时）
+
+    ⚠️ 必须先 replace(tzinfo=timezone.utc) 告诉 Python 输入是 UTC——
+       否则 fromisoformat 返回 naive datetime，astimezone 视为已是本地时区 → 不转换。
+    """
+    if not ts:
+        return ts
+    try:
+        dt = datetime.fromisoformat(str(ts)[:19]).replace(tzinfo=timezone.utc)
+        return dt.astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return str(ts)[:19] if ts else ""
+
+
 def _resolve_name(symbol: str, kind: str) -> str:
     """标的名解析（多级回退，全部失败则返回代码）。结果进程内缓存。"""
     key = f"{kind}:{symbol}"
@@ -1633,9 +1653,9 @@ def _cat_fundflow(limit: int = None, offset: int = 0, sort: str = None) -> Dict[
         out["total_history"] = int(db.conn.execute(
             "SELECT count(DISTINCT symbol) FROM fund_flow_data"
             " WHERE flow_type='main_fund_rank'").fetchone()[0] or 0)
-        out["batch_as_of"] = str(db.conn.execute(
+        out["batch_as_of"] = _utc_to_local(str(db.conn.execute(
             "SELECT max(collected_at) FROM fund_flow_data WHERE flow_type='main_fund_rank'"
-        ).fetchone()[0] or "")[:19].replace("T", " ")
+        ).fetchone()[0] or ""))[:19]
         # 只取最新一批（同一次 collected_at 采集的完整榜单）
         latest_ts = db.conn.execute(
             "SELECT max(collected_at) FROM fund_flow_data WHERE flow_type='main_fund_rank'"
@@ -1904,7 +1924,7 @@ async def get_sectors(
                     "leading_stock": r[6],
                     "leading_symbol": code_map.get(r[6]),
                     "leading_change_pct": r[7],
-                    "data_as_of": str(r[8])[:19].replace("T", " ") if r[8] else None,
+                    "data_as_of": _utc_to_local(r[8]) if r[8] else None,
                 })
             g = {"kind": k, "name": "行业板块" if k == "industry" else "概念板块",
                  "items": items, "total": int(total or 0),

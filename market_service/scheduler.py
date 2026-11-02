@@ -111,6 +111,7 @@ class Scheduler:
         # 单条 or 列表
         items = result.data if isinstance(result.data, list) else [result.data]
         stored = 0
+        failed = 0
         
         for item in items:
             try:
@@ -204,8 +205,10 @@ class Scheduler:
                     self.db.insert_community(community_item)
                     stored += 1
                 elif data_type in ('main_fund_rank', 'sector_fund_flow'):
-                    self.db.insert_fund_flow(item)
-                    stored += 1
+                    if self.db.insert_fund_flow(item):
+                        stored += 1
+                    else:
+                        failed += 1
                 elif data_type in ('limit_up_pool', 'dragon_tiger'):
                     # ⚠️ 这两类是"批量列表"语义：整批一次入库（save_* 自带逐条
                     #    INSERT OR REPLACE），不能走上面的"逐 item"循环——
