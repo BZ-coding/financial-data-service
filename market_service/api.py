@@ -1847,7 +1847,7 @@ async def get_catalog():
                 #   UTC 列（CURRENT_TIMESTAMP）→ 需转本地：fundflow（collected_at）、news（ingested_at）
                 #   日期型（DATE）或应用层本地 → 不转：indices/holdings/dragon/limitup
                 "latest": (_utc_to_local(block["latest"])
-                           if block["key"] in ("fundflow", "news")
+                           if block["key"] == "fundflow"
                            else block["latest"])
                           if block.get("latest") else block.get("latest"),
                 "stale": block.get("stale", True),
