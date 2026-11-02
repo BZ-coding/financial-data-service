@@ -1622,9 +1622,20 @@ def _cat_fundflow(limit: int = None, offset: int = 0, sort: str = None) -> Dict[
     """
     out = {"key": "fundflow", "name": "资金流排行", "items": [], "total": 0}
     try:
+        # 数字诚实（2026-11-02 看板定稿）：total = **本批**实际条数（最新一次采集）；
+        # 历史累计的 DISTINCT symbol 另放 total_history 供参考——769 点进去只有 20 条
+        # 是欺骗性 UI，不能让前端拿到这种 total。
         total = db.conn.execute(
-            "SELECT count(DISTINCT symbol) FROM fund_flow_data WHERE flow_type = 'main_fund_rank'"
+            "SELECT COUNT(*) FROM fund_flow_data WHERE flow_type='main_fund_rank'"
+            " AND collected_at=(SELECT max(collected_at) FROM fund_flow_data"
+            "                   WHERE flow_type='main_fund_rank')"
         ).fetchone()[0]
+        out["total_history"] = int(db.conn.execute(
+            "SELECT count(DISTINCT symbol) FROM fund_flow_data"
+            " WHERE flow_type='main_fund_rank'").fetchone()[0] or 0)
+        out["batch_as_of"] = str(db.conn.execute(
+            "SELECT max(collected_at) FROM fund_flow_data WHERE flow_type='main_fund_rank'"
+        ).fetchone()[0] or "")[:19].replace("T", " ")
         # 只取最新一批（同一次 collected_at 采集的完整榜单）
         latest_ts = db.conn.execute(
             "SELECT max(collected_at) FROM fund_flow_data WHERE flow_type='main_fund_rank'"
@@ -1659,8 +1670,8 @@ def _cat_fundflow(limit: int = None, offset: int = 0, sort: str = None) -> Dict[
         out["items"] = items
         out["total"] = int(total or 0)
         out.update(_mk_stale(latest, _STALE_THRESHOLD["fundflow"]))
-        out["note"] = (f"第 {offset + 1}-{offset + len(items)} 条（共 {out['total']} 条）"
-                       if limit is not None else f"显示前 {len(items)} 条（共 {out['total']} 条）")
+        out["note"] = (f"第 {offset + 1}-{offset + len(items)} 条（本批共 {out['total']} 条）"
+                       if limit is not None else f"显示前 {len(items)} 条（本批共 {out['total']} 条）")
     except Exception as e:
         logger.error(f"资金流排行读取失败: {type(e).__name__}: {e}")
         out.update(_mk_stale(None, _STALE_THRESHOLD["fundflow"]))
@@ -1804,11 +1815,14 @@ async def get_catalog():
             #   实测：快讯 count=60（4 源条目合计）而 news_aggregator_data 只有 16 行快照。
             cats.append({
                 "key": block["key"], "name": block["name"],
+                # 数字诚实（2026-11-02）：fundflow 的 count 现在是**本批**条数
+                # （20），历史累计另放 total_history；其余类别口径不变。
                 "count": block.get("total", 0),
                 "unit": "条" if block["key"] == "news" else "个",
                 "latest": block.get("latest"),
                 "stale": block.get("stale", True),
                 "stale_days": block.get("stale_days"),
+                "batch_as_of": block.get("batch_as_of"),
             })
         payload = {
             "as_of": datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
@@ -1845,8 +1859,12 @@ async def get_sectors(
                 out["groups"].append({"kind": k, "items": [], "total": 0})
                 continue
             total = db.conn.execute(
+                "SELECT COUNT(*) FROM fund_flow_data"
+                " WHERE flow_type='sector_fund_flow' AND sector_kind=? AND collected_at=?",
+                (k, latest_ts)).fetchone()[0]
+            g_total_history = int(db.conn.execute(
                 "SELECT COUNT(DISTINCT symbol) FROM fund_flow_data"
-                " WHERE flow_type='sector_fund_flow' AND sector_kind=?", (k,)).fetchone()[0]
+                " WHERE flow_type='sector_fund_flow' AND sector_kind=?", (k,)).fetchone()[0] or 0)
             lim = min(int(limit), 1000) if limit else total
             rows = db.conn.execute(
                 "SELECT symbol, name, price, change_pct, main_net_inflow, main_net_pct,"
@@ -1883,7 +1901,8 @@ async def get_sectors(
                     "data_as_of": str(r[8])[:19].replace("T", " ") if r[8] else None,
                 })
             g = {"kind": k, "name": "行业板块" if k == "industry" else "概念板块",
-                 "items": items, "total": int(total or 0)}
+                 "items": items, "total": int(total or 0),
+                 "total_history": g_total_history}
             out["groups"].append(g)
         out["cached"] = False
         return out
