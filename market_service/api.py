@@ -1854,16 +1854,20 @@ async def get_sectors(
     try:
         # 板块名 → 代码 反查表（同一批 main_fund_rank 里 name→symbol，进程内缓存即可，这里直接查）
         for k in kinds:
+            # 批次窗口：取 max(collected_at) 往前 5 分钟内的行——
+            # 496 次独立 insert 的时间戳各差 1 秒，精确 = 匹配只命中最后一秒的 2 行。
             latest_ts = db.conn.execute(
                 "SELECT max(collected_at) FROM fund_flow_data"
                 " WHERE flow_type='sector_fund_flow' AND sector_kind=?", (k,)).fetchone()[0]
             if latest_ts is None:
                 out["groups"].append({"kind": k, "items": [], "total": 0})
                 continue
+            from datetime import timedelta
+            window_start = (datetime.fromisoformat(latest_ts) - timedelta(minutes=5))                 .strftime("%Y-%m-%d %H:%M:%S")
             total = db.conn.execute(
                 "SELECT COUNT(*) FROM fund_flow_data"
-                " WHERE flow_type='sector_fund_flow' AND sector_kind=? AND collected_at=?",
-                (k, latest_ts)).fetchone()[0]
+                " WHERE flow_type='sector_fund_flow' AND sector_kind=? AND collected_at >= ?",
+                (k, window_start)).fetchone()[0]
             g_total_history = int(db.conn.execute(
                 "SELECT COUNT(DISTINCT symbol) FROM fund_flow_data"
                 " WHERE flow_type='sector_fund_flow' AND sector_kind=?", (k,)).fetchone()[0] or 0)
@@ -1872,8 +1876,8 @@ async def get_sectors(
                 "SELECT symbol, name, price, change_pct, main_net_inflow, main_net_pct,"
                 " leading_stock, leading_change_pct, collected_at"
                 " FROM fund_flow_data WHERE flow_type='sector_fund_flow' AND sector_kind=?"
-                " AND collected_at=? ORDER BY main_net_inflow DESC LIMIT ?",
-                (k, latest_ts, lim)).fetchall()
+                " AND collected_at >= ? ORDER BY main_net_inflow DESC LIMIT ?",
+                (k, window_start, lim)).fetchall()
             # 领涨股名字 → 代码：只有一级反查（fund_flow_data 历史全量）。
             # 勘查实测最新批命中率 2/9——领涨股不一定在 top20 资金流榜里；
             # 库内没有第二来源（price_data 无 name 列，daily_data 等亦无），查不到就 None，
