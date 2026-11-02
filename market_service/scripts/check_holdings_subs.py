@@ -65,7 +65,11 @@ def main() -> int:
         print(f"[对账巡检] 库连接失败: {e}", file=sys.stderr)
         return 2
     subs = [dict(r) for r in con.execute(
-        "SELECT name, symbol, data_types, frequency_min, enabled, last_collected"
+        # ⚠️ 必须带 id：下面的新鲜度判定要用 subscription_id 查 collection_log。
+        # 2026-11-03 事故：这里漏了 id → sub.get("id") 恒为 None → 所有订阅被
+        # continue 跳过 → fresh 恒空 → 每个标的都报缺口（生产 21 条假警）。
+        # 当时误判成 "mode=ro 读不到 WAL"，实测两种连接结果逐字一致，与 WAL 无关。
+        "SELECT id, name, symbol, data_types, frequency_min, enabled, last_collected"
         " FROM subscriptions WHERE enabled = 1")]
     gaps: list[str] = []
     for sym, kind in sorted(holdings(con)):
@@ -81,22 +85,45 @@ def main() -> int:
             # 所以「订阅在跑但一直失败」检不出来。改查 collection_log 里
             # 该 (symbol, data_type) 最近一次 status='success' 的时间。
             fresh = []
+            last_ok_seen = None
             for sub in hits:
                 sub_id = sub.get("id")
-                if sub_id is None:
-                    continue
-                ok_row = con.execute(
-                    "SELECT MAX(started_at) FROM collection_log"
-                    " WHERE subscription_id = ? AND status = 'success'",
-                    (sub_id,)).fetchone()
-                if ok_row and ok_row[0]:
-                    last_ok = datetime.fromisoformat(str(ok_row[0])[:19])
+                ok_val = None
+                if sub_id is not None:
+                    r = con.execute(
+                        "SELECT MAX(started_at) FROM collection_log"
+                        " WHERE subscription_id = ? AND status = 'success'",
+                        (sub_id,)).fetchone()
+                    ok_val = r[0] if r else None
+                if ok_val is None:
+                    # 兜底（Chief 2026-11-03 批准）：collection_log 里 subscription_id
+                    # 为 NULL 的记录（手工触发/历史数据）关联不上订阅 id，只按 id 匹配
+                    # 会让该标的永远判"无成功记录" → 假警换个形式回来。
+                    # 按 id 查不到时退回按 symbol + data_type 匹配。
+                    r = con.execute(
+                        "SELECT MAX(started_at) FROM collection_log"
+                        " WHERE status = 'success' AND data_type = ?"
+                        "   AND (symbol = ? OR symbol = '*')",
+                        (dt, sym)).fetchone()
+                    ok_val = r[0] if r else None
+                if ok_val:
+                    last_ok = datetime.fromisoformat(str(ok_val)[:19])
+                    if last_ok_seen is None or last_ok > last_ok_seen:
+                        last_ok_seen = last_ok
                     if datetime.now() - last_ok < timedelta(hours=STALE_HOURS):
                         fresh.append(sub)
             if not fresh:
-                last = max(str(s["last_collected"]) for s in hits)
-                gaps.append(f"{sym}({kind}) {dt} 订阅存在但超过 {STALE_HOURS}h 未采集"
-                            f"（最后 {last[:16]}）")
+                # ⚠️ 文案必须报「最后一次**成功**采集」而不是 last_collected：
+                # scheduler 失败时也会更新 last_collected，用它会让告警写着
+                # "最后 2026-11-03 02:42"（刚刚）却判"超过 48h 未采集"，
+                # 读告警的人会被彻底带偏（2026-11-03 实测踩到）。
+                if last_ok_seen is not None:
+                    tail = f"最后成功 {last_ok_seen:%Y-%m-%d %H:%M}"
+                else:
+                    tail = "collection_log 里无任何成功记录"
+                lc = max(str(s["last_collected"] or "") for s in hits)[:16]
+                gaps.append(f"{sym}({kind}) {dt} 订阅存在但超过 {STALE_HOURS}h 未成功采集"
+                            f"（{tail}；last_collected={lc}）")
     n_hold = len(set(holdings(con)))
     if gaps and not quiet:
         print(f"[对账巡检] 持仓 {n_hold} 个标的，发现 {len(gaps)} 个缺口：")
