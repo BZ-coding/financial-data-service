@@ -1033,6 +1033,23 @@ def _quote_of(symbol: str, kind: str) -> Dict[str, Any]:
                            "data_as_of": None, "estimated": False}
     if kind == "stock":
         row = db.get_latest_price(symbol)
+        if row is None:
+            # 资金流个股：price_data 没有它，用 fund_flow 最新快照行当 quote
+            # （勘查实测 769 个 main_fund_rank 标的只有这张表有价/涨跌/净流入）
+            try:
+                fr = db.conn.execute(
+                    "SELECT price, change_pct, main_net_inflow, main_net_pct, collected_at"
+                    " FROM fund_flow_data WHERE flow_type='main_fund_rank' AND symbol = ?"
+                    " ORDER BY collected_at DESC LIMIT 1", (symbol,)).fetchone()
+            except Exception:
+                fr = None
+            if fr:
+                out["last"] = float(fr[0]) if fr[0] is not None else None
+                out["change_pct"] = round(float(fr[1]) * 100, 2) if fr[1] is not None else None
+                out["main_net_inflow"] = float(fr[2]) if fr[2] is not None else None
+                out["main_net_pct"] = float(fr[3]) if fr[3] is not None else None
+                out["data_as_of"] = str(fr[4])[:19].replace("T", " ") if fr[4] else None
+            return out
         if row:
             last = row.get("price")
             prev = row.get("prev_close")
@@ -1596,17 +1613,38 @@ def _cat_holdings() -> Dict[str, Any]:
     return out
 
 
-def _cat_fundflow() -> Dict[str, Any]:
-    """资金流排行（个股主力净流入前 N）。"""
+def _cat_fundflow(limit: int = None, offset: int = 0, sort: str = None) -> Dict[str, Any]:
+    """资金流排行（个股主力净流入，支持分页与排序）。
+
+    分页（2026-11-02 指标看板定稿）：每只个股只取**最新一批快照**里的行——
+    表里同一个 symbol 有历史批次，直接 LIMIT/OFFSET 会翻页翻出旧数据。
+    默认行为（limit=None）与旧版一致：最新一批按 rank_no 前 _LIST_CAP 条，兼容旧前端。
+    """
     out = {"key": "fundflow", "name": "资金流排行", "items": [], "total": 0}
     try:
         total = db.conn.execute(
             "SELECT count(DISTINCT symbol) FROM fund_flow_data WHERE flow_type = 'main_fund_rank'"
         ).fetchone()[0]
+        # 只取最新一批（同一次 collected_at 采集的完整榜单）
+        latest_ts = db.conn.execute(
+            "SELECT max(collected_at) FROM fund_flow_data WHERE flow_type='main_fund_rank'"
+        ).fetchone()[0]
+        if latest_ts is None:
+            out["note"] = "暂无数据"
+            return out
+        order = "rank_no ASC"   # 默认：官方榜rank
+        if sort == "inflow":
+            order = "main_net_inflow DESC"
+        elif sort == "change_pct":
+            order = "change_pct DESC"
+        if limit is None:
+            limit = _LIST_CAP
+        limit = max(1, min(int(limit), 1000))
+        offset = max(0, int(offset))
         rows = db.conn.execute(
-            "SELECT rank_no, symbol, name, price, change_pct, main_net_inflow, main_net_pct, collected_at "
-            "FROM fund_flow_data WHERE flow_type = 'main_fund_rank' "
-            "ORDER BY collected_at DESC, rank_no ASC LIMIT ?", (_LIST_CAP,)).fetchall()
+            f"SELECT rank_no, symbol, name, price, change_pct, main_net_inflow, main_net_pct, collected_at "
+            f"FROM fund_flow_data WHERE flow_type = 'main_fund_rank' AND collected_at = ? "
+            f"ORDER BY {order} LIMIT ? OFFSET ?", (latest_ts, limit, offset)).fetchall()
         latest = None
         items = []
         for r in rows:
@@ -1621,7 +1659,8 @@ def _cat_fundflow() -> Dict[str, Any]:
         out["items"] = items
         out["total"] = int(total or 0)
         out.update(_mk_stale(latest, _STALE_THRESHOLD["fundflow"]))
-        out["note"] = f"显示前 {len(items)} 条（共 {out['total']} 条）"
+        out["note"] = (f"第 {offset + 1}-{offset + len(items)} 条（共 {out['total']} 条）"
+                       if limit is not None else f"显示前 {len(items)} 条（共 {out['total']} 条）")
     except Exception as e:
         logger.error(f"资金流排行读取失败: {type(e).__name__}: {e}")
         out.update(_mk_stale(None, _STALE_THRESHOLD["fundflow"]))
@@ -1699,6 +1738,8 @@ _CATALOG_BUILDERS = {
     "limitup": _cat_limitup,
     "news": _cat_news,
 }
+# 支持分页/排序参数的 builder（其余类别数据量小，前端排即可，保持原样）
+_CATALOG_PAGED = {"fundflow"}
 _CATALOG_ORDER = ("indices", "holdings", "fundflow", "dragon", "limitup", "news")
 
 
@@ -1781,26 +1822,105 @@ async def get_catalog():
         raise HTTPException(500, "目录聚合失败")
 
 
+@app.get("/api/v1/sectors")
+async def get_sectors(
+    kind: str = Query("industry", description="industry=行业 / concept=概念 / all=两组都返回"),
+    limit: int = Query(None, ge=1, le=1000, description="每组条数（默认全部）"),
+):
+    """板块资金流（sector_fund_flow）：行业/概念两组，按净流入降序。
+
+    2026-11-02 指标看板定稿：资金流分类页「板块」tab 的数据源。
+    每个板块只取最新一批快照里的行；leading_stock 是**名字**（上游就没有代码），
+    这里顺带用 main_fund_rank 的 name 列反查代码（leading_symbol），可点进个股详情。
+    """
+    kinds = [kind] if kind in ("industry", "concept") else ["industry", "concept"]
+    out: Dict[str, Any] = {"groups": [], "as_of": datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")}
+    try:
+        # 板块名 → 代码 反查表（同一批 main_fund_rank 里 name→symbol，进程内缓存即可，这里直接查）
+        for k in kinds:
+            latest_ts = db.conn.execute(
+                "SELECT max(collected_at) FROM fund_flow_data"
+                " WHERE flow_type='sector_fund_flow' AND sector_kind=?", (k,)).fetchone()[0]
+            if latest_ts is None:
+                out["groups"].append({"kind": k, "items": [], "total": 0})
+                continue
+            total = db.conn.execute(
+                "SELECT COUNT(DISTINCT symbol) FROM fund_flow_data"
+                " WHERE flow_type='sector_fund_flow' AND sector_kind=?", (k,)).fetchone()[0]
+            lim = min(int(limit), 1000) if limit else total
+            rows = db.conn.execute(
+                "SELECT symbol, name, price, change_pct, main_net_inflow, main_net_pct,"
+                " leading_stock, leading_change_pct, collected_at"
+                " FROM fund_flow_data WHERE flow_type='sector_fund_flow' AND sector_kind=?"
+                " AND collected_at=? ORDER BY main_net_inflow DESC LIMIT ?",
+                (k, latest_ts, lim)).fetchall()
+            # 领涨股名字 → 代码（一次查出本批全部名字，避免 N+1）
+            names = [r[6] for r in rows if r[6]]
+            code_map: Dict[str, str] = {}
+            if names:
+                ph = ",".join("?" * len(names))
+                try:
+                    for r2 in db.conn.execute(
+                        f"SELECT name, symbol FROM fund_flow_data WHERE flow_type='main_fund_rank'"
+                        f" AND name IN ({ph}) AND collected_at="
+                        f"(SELECT max(collected_at) FROM fund_flow_data WHERE flow_type='main_fund_rank')",
+                        names).fetchall():
+                        code_map.setdefault(r2[0], r2[1])
+                except Exception:
+                    pass
+            items = []
+            for r in rows:
+                items.append({
+                    "symbol": r[0], "name": r[1], "kind": "sector",
+                    "last": r[2], "change_pct": r[3],
+                    "main_net_inflow": r[4], "main_net_pct": r[5],
+                    "leading_stock": r[6],
+                    "leading_symbol": code_map.get(r[6]),
+                    "leading_change_pct": r[7],
+                    "data_as_of": str(r[8])[:19].replace("T", " ") if r[8] else None,
+                })
+            g = {"kind": k, "name": "行业板块" if k == "industry" else "概念板块",
+                 "items": items, "total": int(total or 0)}
+            out["groups"].append(g)
+        out["cached"] = False
+        return out
+    except Exception as e:
+        logger.exception(f"板块数据读取失败: {e}")
+        raise HTTPException(500, "板块数据读取失败")
+
+
 @app.get("/api/v1/catalog/{cat}")
-async def get_catalog_category(cat: str):
-    """L2：某一类别的列表（大列表截前 50，返回 total）。"""
+async def get_catalog_category(
+    cat: str,
+    limit: int = Query(None, ge=1, le=1000, description="每页条数（默认 50，兼容旧前端）"),
+    offset: int = Query(0, ge=0, description="偏移"),
+    sort: str = Query(None, description="fundflow 专用：inflow=按净流入 / change_pct=按涨跌幅；默认按官方 rank"),
+):
+    """L2：某一类别的列表。fundflow 支持 limit/offset/sort（2026-11-02 看板定稿）。
+
+    缓存键带参数（不同分页各自缓存），stamp 失效策略不变。
+    """
     if cat not in _CATALOG_BUILDERS:
         raise HTTPException(404, f"未知类别 {cat!r}；可用：{', '.join(_CATALOG_ORDER)}")
     try:
         stamp = _catalog_stamp()
         now = time.time()
-        cached = _L2_CACHE.get(cat)
+        cache_key = f"{cat}:{limit}:{offset}:{sort}" if cat in _CATALOG_PAGED else cat
+        cached = _L2_CACHE.get(cache_key)
         if (cached and cached["stamp"] == stamp and (now - cached["at"]) < _CAT_TTL_SECONDS):
             payload = dict(cached["payload"])
             payload["cached"] = True
             payload["cache_age_sec"] = round(now - cached["at"], 1)
             return payload
 
-        block = _CATALOG_BUILDERS[cat]()
+        if cat in _CATALOG_PAGED:
+            block = _CATALOG_BUILDERS[cat](limit=limit, offset=offset, sort=sort)
+        else:
+            block = _CATALOG_BUILDERS[cat]()
         block["as_of"] = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
         block["cached"] = False
         block["cache_age_sec"] = 0
-        _L2_CACHE[cat] = {"stamp": stamp, "at": now, "payload": block}
+        _L2_CACHE[cache_key] = {"stamp": stamp, "at": now, "payload": block}
         return block
     except Exception as e:
         logger.exception(f"类别 {cat} 失败: {e}")
@@ -1834,6 +1954,17 @@ async def get_detail(symbol: str = Query(..., description="标的代码（来自
             try:
                 if db.conn.execute("SELECT 1 FROM nav_data WHERE symbol = ? LIMIT 1", (sym,)).fetchone():
                     kind = "fund"
+            except Exception:
+                pass
+        # ④ 资金流个股（2026-11-02 指标看板勘查：769 个 main_fund_rank 标的
+        #    只存在于 fund_flow_data，price_data/nav_data/index_data 都没有 →
+        #    点详情全部 404。加第四级识别，quote 用资金流快照行）。
+        if kind is None:
+            try:
+                if db.conn.execute(
+                    "SELECT 1 FROM fund_flow_data WHERE flow_type='main_fund_rank'"
+                    " AND symbol = ? LIMIT 1", (sym,)).fetchone():
+                    kind = "stock"
             except Exception:
                 pass
         if kind is None:
