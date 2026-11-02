@@ -1443,14 +1443,33 @@ def _utc_to_local(ts: str) -> str:
 
     ⚠️ 必须先 replace(tzinfo=timezone.utc) 告诉 Python 输入是 UTC——
        否则 fromisoformat 返回 naive datetime，astimezone 视为已是本地时区 → 不转换。
+
+    ⚠️ 输入**已带偏移**（如 `...00:49:33+08:00`）时不能再按 UTC 加 8 小时——
+       那会把 00:49 变成 08:49（未来时间）。批评家 2026-11-03 03:00 就是看到
+       这个 08:49 才判 news 时区仍没修好。旧实现用 `str(ts)[:19]` 盲目截掉偏移
+       再当 UTC 处理，任何带偏移的入参都会错 8 小时。
+       现在：能解析出带偏移的直接按绝对时刻换算成本地（+08:00 入参结果不变，
+       未来若有人传入 +00:00 的串也能得到正确本地时间）；无偏移才按库里的 UTC 口径。
     """
     if not ts:
         return ts
+    raw = str(ts).strip()
     try:
-        dt = datetime.fromisoformat(str(ts)[:19]).replace(tzinfo=timezone.utc)
+        dt = datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        dt = None
+    if dt is not None:
+        if dt.tzinfo is None:
+            # 无偏移 = 库里 DEFAULT CURRENT_TIMESTAMP 的 UTC 口径
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    # 兜底：非 ISO 串，维持旧行为（截 19 位当 UTC）
+    try:
+        dt = datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone.utc)
         return dt.astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
     except (ValueError, TypeError):
-        return str(ts)[:19] if ts else ""
+        return raw[:19]
 
 
 def _resolve_name(symbol: str, kind: str) -> str:
