@@ -635,6 +635,21 @@ class Database:
             END ASC
         """, (symbol, start_time))
         return [dict(row) for row in cur.fetchall()]
+    def get_daily_history(self, symbol: str, days: int = 60) -> List[Dict[str, Any]]:
+        """日 K 历史（daily_data：东财日线回填/增量，见 scripts/backfill_daily_kline.py）。
+
+        ⚠️ A3 时区口径：trade_date 是 DATE 型（本地交易日历），cutoff 按本地日历天
+           计算，与 started_at 等本地列同一口径；daily_data **不在清理策略里**
+           （指标需要 ≥60 根，做 90 天清理会把它截短）。
+           升序返回，与 bars_from_intraday 的输出方向一致。
+        """
+        cutoff = (datetime.now(TZ) - timedelta(days=days)).strftime("%Y-%m-%d")
+        cur = self.conn.execute(
+            "SELECT trade_date, open, high, low, close, vol, amount"
+            " FROM daily_data WHERE symbol = ? AND trade_date >= ?"
+            " ORDER BY trade_date ASC", (symbol, cutoff))
+        return [dict(row) for row in cur.fetchall()]
+
 
     def get_latest_price(self, symbol: str, source: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """获取最新行情，直接返回最新数据

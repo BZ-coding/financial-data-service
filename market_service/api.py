@@ -961,6 +961,8 @@ _DASH_TTL_SECONDS = 60
 
 # 股票指标的取数窗口 —— **必须与 /api/v1/indicator 的默认 days 相同**（60）
 _INDICATOR_LOOKBACK_DAYS = 60
+# 日线回退阈值：price_data bars < 20（= insufficient 阈值）才允许切 daily_data 源
+_IND_FALLBACK_MIN_BARS = 20
 
 _NEWS_SOURCE_KEYS = ("caijing", "eeo", "sina_live", "ths_hk")
 _NEWS_DEFAULT_LIMIT = 20
@@ -1124,6 +1126,28 @@ def _indicators_of(symbol: str, kind: str) -> Dict[str, Any]:
             #   会对同一标的给出不同数值 → 用户会以为其中一个算错了。
             bars = fin_indicators.bars_from_intraday(
                 db.get_price_history(symbol, _INDICATOR_LOOKBACK_DAYS))
+            # ★ 日线回退（2026-11-03 用户需求：资金流榜个股也要显示技术指标）：
+            #   资金流榜 300 只在 price_data 里 0 条盘中快照 → bars=0 → 指标区一直空。
+            #   回退到 daily_data（东财日线回填/增量，scripts/backfill_daily_kline.py），
+            #   拼出与 bars_from_intraday **完全相同结构**的 bars（date/open/high/low/
+            #   close/volume，按日期升序）→ 下游 ma_series/macd_series/rsi_wilder/
+            #   high_low_n 纯函数零改动。
+            #   ⚠️ 只在 price_data 严重不足（<20 根，即 insufficient 阈值）时才切源，
+            #      且 daily_data 行数必须更多才替换——持仓股的既有路径零改动。
+            #      daily 有真实 OHLC → has_hl=True（20日高低有意义）。
+            if len(bars) < _IND_FALLBACK_MIN_BARS:
+                try:
+                    daily = db.get_daily_history(symbol, _INDICATOR_LOOKBACK_DAYS)
+                    if daily and len(daily) > len(bars):
+                        bars = [{"date": str(r["trade_date"]),
+                                 "open": r["open"], "high": r["high"],
+                                 "low": r["low"], "close": r["close"],
+                                 "volume": float(r["vol"] or 0)} for r in daily]
+                        logger.info("指标日线回退生效 %s: price bars→daily bars=%d",
+                                    symbol, len(bars))
+                except Exception as e:
+                    logger.warning("指标日线回退失败 %s（保持 price_data 结果）: %s: %s",
+                                   symbol, type(e).__name__, e)
             has_hl = True
         elif kind == "index":
             # 指数：index_data → 日K（**内置去重**：剔周末 + 复用快照，见 indexbars 文档）
