@@ -1236,7 +1236,12 @@ class Database:
         self.conn.commit()
 
     def get_recent_errors(self, hours: int = 1) -> List[Dict[str, Any]]:
-        """获取最近N小时的错误日志"""
+        """获取最近N小时的错误日志
+
+        ⚠️ A3 时区口径：collection_log.started_at 由本函数同文件的 insert 写入，
+           用 datetime.now(TZ)（本地 Asia/Shanghai）；这里 cutoff 也用本地，
+           **本地对本地，一致**。不要"顺手"改成 UTC——那是另一种口径混用。
+        """
         start = datetime.now(TZ) - timedelta(hours=hours)
         cur = self.conn.execute("""
             SELECT * FROM collection_log
@@ -1261,9 +1266,12 @@ class Database:
         active_subs = cur.fetchone()['cnt']
 
         # 最近24小时成功率
+        # ⚠️ A3：collection_log.started_at 存**本地**时间，而 SQLite datetime('now')
+        #    是 **UTC** —— 直接用会把"24 小时"错算成 32 小时（UTC 比本地早 8h，
+        #    早 8h 的时间戳更小 → 更多行 ≥ 它）。必须加 'localtime' 对齐写入口径。
         cur = self.conn.execute("""
             SELECT status, COUNT(*) as cnt FROM collection_log
-            WHERE started_at >= datetime('now', '-1 day')
+            WHERE started_at >= datetime('now', 'localtime', '-1 day')
             GROUP BY status
         """)
         status_counts = {row['status']: row['cnt'] for row in cur.fetchall()}
@@ -1299,20 +1307,30 @@ class Database:
     #   ② **collection_log 保留期硬编码 30 天**，不读配置 → 无法调整。
     #   ③ **不覆盖几个最大的表**（news_aggregator_data 756MB / mmx_search_data 265MB），
     #      而 collection_log 连索引合计 435MB —— 库体积大头完全没被管。
+    # ⚠️⚠️ A3（2026-11-03 批评家）：最后一列是**时间列的时区口径标注**，必须显式。
+    #    同一个 cutoff 函数没法同时服务两种口径的列——本项目同一张库里两种口径都有：
+    #      utc   = SQLite DEFAULT CURRENT_TIMESTAMP / 应用写 datetime.now(timezone.utc)
+    #              （恒 UTC，与本地差 8 小时）
+    #      local = 应用写本地时间 datetime.now(TZ)（行情时间、调度时间、DATE 交易日历）
+    #    口径是 2026-11-03 逐列实测 MAX(col) 与当时 UTC/本地时间对照定下的：
+    #      started_at 11:38=本地 ✓ │ trade_time 15:00=本地收盘 ✓ │ ingested_at 03:14=UTC ✓
+    #      trade_date=DATE 按本地交易日历 │ estimate_nav/aggregator/mmx/fund_flow=UTC ✓
     CLEANUP_POLICIES = [
-        ("collection_log",      "started_at",  "log_days",           30, "采集日志（表+索引合计 435MB）"),
+        ("collection_log",      "started_at",  "log_days",           30, "采集日志（表+索引合计 435MB）", "local"),
         # price_data 默认 60 → 90 天：dsa-mcp 的 analyze_trend(days=60) 要 60 天窗口，
         # 保留期正好卡在 60 天会在边界删掉刚采到的数据 → 留 30 天余量
-        ("price_data",          "trade_time",  "price_days",         90, "实时行情快照（dsa-mcp 需 60 天窗口，留 30 天余量）"),
-        ("news_data",           "ingested_at", "news_days",          30, "个股新闻（link UNIQUE，删后可重采）"),
-        ("minute_data",         "trade_date",  "minute_days",        60, "分钟K线"),
-        ("estimate_nav_data",   "ingested_at", "estimate_nav_days",  30, "盘中估算净值"),
-        ("news_aggregator_data","ingested_at", "aggregator_days",    14, "全网聚合新闻（单行可达 30KB）"),
-        ("mmx_search_data",     "collected_at","mmx_search_days",    90, "财经搜索结果（长期无消费）"),
+        ("price_data",          "trade_time",  "price_days",         90, "实时行情快照（dsa-mcp 需 60 天窗口，留 30 天余量）", "local"),
+        ("news_data",           "ingested_at", "news_days",          30, "个股新闻（link UNIQUE，删后可重采）", "utc"),
+        # minute_data.trade_date 是 DATE 型（纯日期）：与带时间的 cutoff 比较按
+        # 字符串字典序，边界日整天一起删——按本地交易日历口径，符合预期。
+        ("minute_data",         "trade_date",  "minute_days",        60, "分钟K线", "local"),
+        ("estimate_nav_data",   "ingested_at", "estimate_nav_days",  30, "盘中估算净值", "utc"),
+        ("news_aggregator_data","ingested_at", "aggregator_days",    14, "全网聚合新闻（单行可达 30KB）", "utc"),
+        ("mmx_search_data",     "collected_at","mmx_search_days",    90, "财经搜索结果（长期无消费）", "utc"),
         # 2026-11-03（项 ⑥）：fund_flow_data 原来不在保留列表——top_n 扩容后
         # 300 个股 + 992 板块 × ~6 批/日 ≈ 7750 行/天 ≈ 550MB/年，无限增长。
         # 90 天与前值分析窗口匹配；更早的批次只对历史回测有用。
-        ("fund_flow_data",      "collected_at","fund_flow_days",     90, "资金流（个股+板块，top_n 扩容后 ~7750 行/日）"),
+        ("fund_flow_data",      "collected_at","fund_flow_days",     90, "资金流（个股+板块，top_n 扩容后 ~7750 行/日）", "utc"),
     ]
 
     def cleanup_old_data(self, retention_days: Dict[str, int], dry_run: bool = False) -> Dict[str, Any]:
@@ -1325,15 +1343,21 @@ class Database:
         Returns:
             {"deleted": {表名: 行数}, "cutoffs": {表名: 截止时间}, "dry_run": bool}
         """
-        now = datetime.now(timezone.utc)  # P0: cutoff 用 UTC（collected_at 存 UTC，本地 cutoff 多删 8h 窗口）
+        # A3：cutoff 按**列的口径**取——UTC 列用 UTC now，本地列用本地 now。
+        # 此前一刀切 UTC：对 local 列（collection_log.started_at / price_data.trade_time）
+        # 会少删 8 小时窗口（保守方向，无数据损失，但保留期悄悄变长 8h）。
+        now_utc = datetime.now(timezone.utc)
+        now_local = datetime.now(TZ)
         deleted_counts = {}
         cutoffs = {}
 
-        for table, time_col, cfg_key, default_days, desc in self.CLEANUP_POLICIES:
+        for table, time_col, cfg_key, default_days, desc, tz in self.CLEANUP_POLICIES:
             days = int(retention_days.get(cfg_key, default_days))
+            now = now_utc if tz == "utc" else now_local
             cutoff = now - timedelta(days=days)
             cutoff_s = cutoff.strftime("%Y-%m-%d %H:%M:%S")
-            cutoffs[table] = {"cutoff": cutoff_s, "retention_days": days, "desc": desc}
+            cutoffs[table] = {"cutoff": cutoff_s, "retention_days": days,
+                              "desc": desc, "tz": tz}
             try:
                 if dry_run:
                     cur = self.conn.execute(

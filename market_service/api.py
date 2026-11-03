@@ -1933,23 +1933,30 @@ async def get_sectors(
                 " FROM fund_flow_data WHERE flow_type='sector_fund_flow' AND sector_kind=?"
                 " AND collected_at >= ? ORDER BY main_net_inflow DESC LIMIT ?",
                 (k, window_start, lim)).fetchall()
-            # 领涨股名字 → 代码：只有一级反查（fund_flow_data 历史全量）。
-            # 勘查实测最新批命中率 2/9——领涨股不一定在 top20 资金流榜里；
-            # 库内没有第二来源（price_data 无 name 列，daily_data 等亦无），查不到就 None，
-            # 前端按"领涨股名字可显示、代码不可点"容错。根修是采集器回填 stock_basic_data，
-            # 已报 Chief 另派，不在本卡范围。
-            names = [r[6] for r in rows if r[6]]
+            # 领涨股名字 → 代码：查 **stock_basic_data**（全市场股票列表）。
+            # 2026-11-03 A1（批评家点名的换源）：
+            #   原来查 fund_flow_data(main_fund_rank) 历史全量，命中 143/495=28%——
+            #   领涨股不一定在主力榜里；stock_basic_data 是全市场列表，
+            #   命中 1431/1472=97%。2026-11-03 又用 akshare 回填了北交所 920 段
+            #   354 只（scripts/backfill_stock_basic.py），北交所领涨股也可点了。
+            #   ⚠️ 名字→代码可能一对多（跨市场同名 / 改名），按 updated_at 取最新；
+            #      symbol 只在 (symbol, source) 内唯一，跨 source 允许重名。
+            #   查不到就 None：前端按"领涨股名字可显示、代码不可点"容错。
+            names = [r[6] for r in rows
+                     if r[6] and r[6].strip() not in ("-", "—", "")]
             code_map: Dict[str, str] = {}
             if names:
                 ph = ",".join("?" * len(names))
                 try:
                     for r2 in db.conn.execute(
-                        f"SELECT name, symbol, max(collected_at) FROM fund_flow_data"
-                        f" WHERE flow_type='main_fund_rank' AND name IN ({ph})"
-                        f" GROUP BY name", names).fetchall():
-                        code_map[r2[0]] = r2[1]
-                except Exception:
-                    pass
+                        f"SELECT name, symbol FROM stock_basic_data"
+                        f" WHERE name IN ({ph})"
+                        f" ORDER BY updated_at DESC", names).fetchall():
+                        code_map.setdefault(r2[0], r2[1])
+                except Exception as e:
+                    # 反查失败只影响"可点"，绝不能让整个板块接口 500
+                    logger.warning("领涨股反查失败（leading_symbol 置空）: %s: %s",
+                                   type(e).__name__, e)
             items = []
             for r in rows:
                 items.append({
