@@ -29,6 +29,16 @@ from datetime import datetime, timedelta
 DB = "file:/home/zsd/financial-data-service/market_service/data/market.db?mode=ro"
 FUND_RETENTION_DAYS = 30      # 与 api.py 同口径：陈年残留不算持仓
 STALE_HOURS = 48              # 订阅采集新鲜度阈值（Chief 确认）
+# 市场数据新鲜度（Chief 2026-11-03 批的第二维度，hk09988"假断更"事故引出）：
+# 订阅在跑且采集成功 ≠ 数据新鲜。判市场数据年龄必须用归一化后的 trade_time，
+# 裸 MAX(trade_time) 被混合格式骗（字典序 '2026...' > '2026-...'，恒返回 compact
+# 旧行 → 看着像断更 4 天，实际 23:16 刚写入；程序员 2026-11-03 实测定位）。
+NORM_TRADE_TIME = (
+    "CASE WHEN trade_time LIKE '____-__-__%'"
+    " THEN replace(substr(trade_time,1,19),'T',' ')"
+    " ELSE substr(trade_time,1,4)||'-'||substr(trade_time,5,2)||'-'||substr(trade_time,7,2)"
+    "      ||' '||substr(trade_time,10,8) END")
+STALE_DAYS_STOCK = 3          # price 数据落后超过 3 个自然日 → WARN（hk 双雄快照路径恒新鲜，A 股收盘后隔日属正常）
 NEEDED = {"stock": ["price"], "fund": ["nav", "estimate_nav"]}
 
 
@@ -124,6 +134,19 @@ def main() -> int:
                 lc = max(str(s["last_collected"] or "") for s in hits)[:16]
                 gaps.append(f"{sym}({kind}) {dt} 订阅存在但超过 {STALE_HOURS}h 未成功采集"
                             f"（{tail}；last_collected={lc}）")
+                continue
+            # 第二维度（Chief 2026-11-03 批）：采集在跑，但市场数据本身陈旧。
+            # 只查 stock/price：基金净值天然隔日出，不适用盘中新鲜度。
+            if dt == "price" and kind == "stock":
+                r = con.execute(
+                    f"SELECT MAX({NORM_TRADE_TIME}) FROM price_data WHERE symbol = ?",
+                    (sym,)).fetchone()
+                last_px = r[0] if r else None
+                age = days_since(last_px) if last_px else None
+                # days_since 只取前 10 位日期，归一化后的 'YYYY-MM-DD HH:MM:SS' 兼容
+                if age is not None and age > STALE_DAYS_STOCK:
+                    gaps.append(f"{sym}(stock) price 采集成功但数据陈旧：最新行情 {last_px}"
+                                f"（{age} 天前，阈值 {STALE_DAYS_STOCK} 天）")
     n_hold = len(set(holdings(con)))
     if gaps and not quiet:
         print(f"[对账巡检] 持仓 {n_hold} 个标的，发现 {len(gaps)} 个缺口：")
