@@ -8,6 +8,7 @@ import sys
 import os
 import json
 import asyncio
+import time
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone, timedelta
 import logging
@@ -493,7 +494,11 @@ class AKShareFetcher(BaseCollector):
 
     # ========== 公告采集（巨潮资讯） ==========
     def _fetch_announcement_cninfo(self, symbol: str) -> Optional[List[Dict[str, Any]]]:
-        """从巨潮资讯获取公告数据"""
+        """公告采集：股票优先巨潮；巨潮无数据时再试基金公告（东财）。
+
+        注意 002202 同时是股票和一只基金的代码，不能先查基金，
+        否则股票会拿到同名基金的公告。先巨潮、空结果再基金。
+        """
         try:
             # 近30天
             end_date = now_tz().strftime('%Y%m%d')
@@ -504,26 +509,74 @@ class AKShareFetcher(BaseCollector):
                 start_date=start_date,
                 end_date=end_date
             )
-            if df is None or df.empty:
-                return []
-            result = []
-            for _, row in df.head(50).iterrows():
-                result.append({
-                    'title': str(row.get('公告标题', '')),
-                    'announcement_time': str(row.get('公告时间', '')),
-                    'link': str(row.get('公告链接', '')),
-                    'raw': row.to_dict()
-                })
-            return result
+            if df is not None and not df.empty:
+                result = []
+                for _, row in df.head(50).iterrows():
+                    result.append({
+                        'title': str(row.get('公告标题', '')),
+                        'announcement_time': str(row.get('公告时间', '')),
+                        'link': str(row.get('公告链接', '')),
+                        'raw': row.to_dict()
+                    })
+                return result
         except Exception as e:
             self.logger.warning(f"_fetch_announcement_cninfo({symbol})异常: {e}")
+
+        # 巨潮为空/失败 → 基金公告（东财）
+        return self._fetch_fund_announcement_eastmoney(symbol)
+
+    def _fetch_fund_announcement_eastmoney(self, symbol: str) -> Optional[List[Dict[str, Any]]]:
+        """从东方财富基金公告接口取基金公告（仅基金代码走这里）。
+
+        股票统一先走巨潮；巨潮为空时才调用本方法，避免 002202 这类
+        股票/基金同代码碰撞。链接直接使用 pdf.dfcfw.com 的 PDF 直链。
+        """
+        try:
+            url = (
+                'https://api.fund.eastmoney.com/f10/JJGG'
+                f'?fundcode={symbol}&pageIndex=1&pageSize=50&type=0'
+            )
+            text = self._get_with_backoff(
+                url,
+                headers={
+                    'Referer': 'https://fundf10.eastmoney.com/',
+                    'User-Agent': 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36',
+                },
+                timeout=15,
+            )
+            data = json.loads(text)
+            rows = data.get('Data') or []
+            result: List[Dict[str, Any]] = []
+            for row in rows:
+                announce_id = str(row.get('ID') or '').strip()
+                title = str(row.get('TITLE') or '').strip()
+                if not announce_id or not title:
+                    continue
+                ann_time = (
+                    row.get('PUBLISHDATEDesc')
+                    or str(row.get('PUBLISHDATE') or '')[:10]
+                )
+                result.append({
+                    'title': title,
+                    'announcement_time': ann_time,
+                    'link': f'https://pdf.dfcfw.com/pdf/H2_{announce_id}_1.pdf',
+                    'source': 'eastmoney_fund',
+                    'raw': row,
+                })
+            if result:
+                self.logger.info(
+                    f"基金公告 {symbol}: {len(result)} 条（东财）"
+                )
+            return result
+        except Exception as e:
+            self.logger.warning(f"_fetch_fund_announcement_eastmoney({symbol})异常: {e}")
             return None
 
     def _normalize_announcement(self, raw: Dict[str, Any], symbol: str) -> Dict[str, Any]:
         """标准化公告数据"""
         ann_time = raw.get('announcement_time', '')
         return {
-            'source': 'cninfo',
+            'source': raw.get('source', 'cninfo'),
             'symbol': symbol,
             'title': raw.get('title', ''),
             'announcement_time': ann_time,
