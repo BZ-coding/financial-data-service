@@ -2426,7 +2426,7 @@ async def get_alerts(
                         if severity and sev != severity:
                             continue
                         items.append({
-                            "ts": ts,
+                            "ts": str(sig.get("ts") or ts),
                             "symbol": sym,
                             "name": names.get(sym, sym),
                             "severity": sev,
