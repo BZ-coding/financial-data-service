@@ -2371,6 +2371,77 @@ async def api_guide():
 """
     return HTMLResponse(html)
 
+# ==================== 告警历史（只读，给 App 用） ====================
+
+ALERT_HISTORY_PATH = Path.home() / ".hermes" / "alert_history.jsonl"
+
+
+def _alert_name_map() -> Dict[str, str]:
+    """持仓 JSON → {symbol: 中文名}，用于告警列表显示。"""
+    names: Dict[str, str] = {}
+    portfolio_dir = Path.home() / ".hermes" / "portfolio"
+    if not portfolio_dir.exists():
+        return names
+    for file in portfolio_dir.glob("*.json"):
+        try:
+            data = json.loads(file.read_text(encoding="utf-8"))
+            for pos in data.get("positions", []) or []:
+                sym = pos.get("symbol") or pos.get("code")
+                name = (pos.get("name") or "").strip()
+                if sym and name:
+                    names[str(sym)] = name
+        except Exception:
+            continue
+    return names
+
+
+@app.get("/api/v1/alerts")
+async def get_alerts(
+    limit: int = Query(50, ge=1, le=500),
+    symbol: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+):
+    """最近告警（来自 alert_daemon 的 alert_history.jsonl），按时间倒序。"""
+    if not ALERT_HISTORY_PATH.exists():
+        return {"items": [], "total": 0}
+    names = _alert_name_map()
+    items: List[Dict[str, Any]] = []
+    try:
+        with ALERT_HISTORY_PATH.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    continue
+                ts = record.get("ts") or ""
+                for group in record.get("groups", []) or []:
+                    sym = str(group.get("sym") or "")
+                    for sig in group.get("signals", []) or []:
+                        sev = str(sig.get("severity") or "")
+                        if symbol and sym != symbol:
+                            continue
+                        if severity and sev != severity:
+                            continue
+                        items.append({
+                            "ts": ts,
+                            "symbol": sym,
+                            "name": names.get(sym, sym),
+                            "severity": sev,
+                            "rule_id": sig.get("rule_id") or "",
+                            "rule_name": sig.get("name") or "",
+                            "reason": sig.get("reason") or "",
+                        })
+    except Exception as exc:
+        logger.warning(f"读取告警历史失败: {exc}")
+        return {"items": [], "total": 0}
+    items.sort(key=lambda item: item["ts"], reverse=True)
+    total = len(items)
+    return {"items": items[:limit], "total": total}
+
+
 # ==================== 生命周期 ====================
 
 @app.on_event("startup")
