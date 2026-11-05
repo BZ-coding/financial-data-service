@@ -2442,6 +2442,88 @@ async def get_alerts(
     return {"items": items[:limit], "total": total}
 
 
+# ==================== App 自定义告警规则（Basic Auth 写门禁沿用） ====================
+
+ALERT_RULES_PATH = Path.home() / ".hermes" / "custom_alert_rules.json"
+ALERT_RULE_FIELDS = {
+    "price", "change_pct", "bias_ma5_pct", "rsi_14",
+    "volume_ratio", "ma5", "ma20",
+}
+ALERT_RULE_OPS = {"gt", "gte", "lt", "lte"}
+ALERT_RULE_SEVERITIES = {"low", "medium", "high"}
+
+
+def _load_alert_rules() -> List[Dict[str, Any]]:
+    if not ALERT_RULES_PATH.exists():
+        return []
+    try:
+        data = json.loads(ALERT_RULES_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_alert_rules(rules: List[Dict[str, Any]]) -> None:
+    ALERT_RULES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ALERT_RULES_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(rules, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(ALERT_RULES_PATH)
+
+
+@app.get("/api/v1/alert-rules")
+async def list_alert_rules():
+    return {"items": _load_alert_rules()}
+
+
+@app.post("/api/v1/alert-rules")
+async def upsert_alert_rule(request: Request):
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "规则必须是 JSON 对象")
+    rule_id = str(payload.get("id") or "").strip()
+    symbol = str(payload.get("symbol") or "").strip()
+    field = str(payload.get("field") or "").strip()
+    op = str(payload.get("op") or "").strip()
+    severity = str(payload.get("severity") or "low").strip()
+    try:
+        threshold = float(payload.get("value"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "阈值必须是数字")
+    if not rule_id or not symbol:
+        raise HTTPException(400, "id/symbol 不能为空")
+    if field not in ALERT_RULE_FIELDS:
+        raise HTTPException(400, f"不支持的字段: {field}")
+    if op not in ALERT_RULE_OPS:
+        raise HTTPException(400, f"不支持的比较符: {op}")
+    if severity not in ALERT_RULE_SEVERITIES:
+        raise HTTPException(400, f"不支持的级别: {severity}")
+    rule = {
+        "id": rule_id,
+        "symbol": symbol,
+        "name": str(payload.get("name") or "").strip() or f"{symbol} {field} {op} {threshold:g}",
+        "field": field,
+        "field_label": str(payload.get("field_label") or field),
+        "op": op,
+        "value": threshold,
+        "severity": severity,
+        "enabled": bool(payload.get("enabled", True)),
+    }
+    rules = [r for r in _load_alert_rules() if r.get("id") != rule_id]
+    rules.append(rule)
+    _save_alert_rules(rules)
+    return {"item": rule, "total": len(rules)}
+
+
+@app.delete("/api/v1/alert-rules/{rule_id}")
+async def delete_alert_rule(rule_id: str):
+    rules = _load_alert_rules()
+    kept = [r for r in rules if r.get("id") != rule_id]
+    if len(kept) == len(rules):
+        raise HTTPException(404, "规则不存在")
+    _save_alert_rules(kept)
+    return {"deleted": rule_id, "total": len(kept)}
+
+
 # ==================== 生命周期 ====================
 
 @app.on_event("startup")
