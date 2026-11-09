@@ -296,6 +296,14 @@ class Scheduler:
             return self.db.save_limit_up_pool(items) or 0
         if data_type == 'dragon_tiger':
             return self.db.save_dragon_tiger(items) or 0
+        if data_type == 'etf_profile':
+            return self.db.save_etf_profile(items) or 0
+        if data_type == 'index_valuation':
+            return self.db.save_index_valuation(items) or 0
+        if data_type == 'index_constituents':
+            return self.db.save_index_constituents(items) or 0
+        if data_type == 'etf_margin':
+            return self.db.save_etf_margin(items) or 0
         return 0
 
     def _load_config(self, path: str) -> Dict[str, Any]:
@@ -587,8 +595,47 @@ class Scheduler:
         }
 
         # 对每个data_type执行采集
+        BATCH_TYPES = ('etf_profile', 'index_valuation', 'index_constituents', 'etf_margin')
         for data_type in data_types:
             start_time = now_tz()
+            # 整批类型走专用采集器 + 整批入库
+            if data_type in BATCH_TYPES:
+                if source_type not in self.collectors:
+                    raise ValueError(f"未知的采集器类型: {source_type}")
+                collector = self.collectors.get('akshare')  # akshare fetcher 持有 venv 内 akshare
+                # 这些类型由专用 collector 处理；直接实例化
+                if data_type == 'etf_profile':
+                    from .collectors.etf_index import ETFProfileCollector
+                    collector = ETFProfileCollector()
+                elif data_type == 'index_valuation':
+                    from .collectors.etf_index import IndexValuationCollector
+                    collector = IndexValuationCollector()
+                elif data_type == 'index_constituents':
+                    from .collectors.etf_index import IndexConstituentsCollector
+                    collector = IndexConstituentsCollector()
+                elif data_type == 'etf_margin':
+                    from .collectors.etf_index import ETFMarginCollector
+                    collector = ETFMarginCollector()
+                result = await collector.collect_with_retry(
+                    symbol=symbol or "*", data_type=data_type, max_retries=2, **config)
+                items_stored = self._store_batch_result(data_type, result.data or []) if result.success else 0
+                self.db.log_collection(
+                    subscription_id=sub_id,
+                    source=result.source,
+                    symbol=result.symbol,
+                    data_type=result.data_type,
+                    status="success" if result.success else "failed",
+                    items_fetched=len(result.data) if result.data and isinstance(result.data, list) else 0,
+                    items_stored=items_stored,
+                    error_message=result.error,
+                    started_at=start_time,
+                    finished_at=now_tz()
+                )
+                if result.success:
+                    logger.info(f"  订阅[{name}]采集成功: {result.data_type}, {items_stored}条")
+                else:
+                    logger.warning(f"  订阅[{name}]采集失败: {result.error}")
+                continue
             use_router = data_type in ROUTABLE_TYPES and source_type == 'akshare'
             use_chain = data_type in CHAIN_TYPES and source_type == 'akshare'
 

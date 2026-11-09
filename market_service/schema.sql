@@ -565,3 +565,49 @@ CREATE TABLE IF NOT EXISTS bid_ask_data (
 );
 CREATE INDEX IF NOT EXISTS idx_bid_ask_symbol ON bid_ask_data(symbol);
 CREATE INDEX IF NOT EXISTS idx_bid_ask_collected ON bid_ask_data(collected_at);
+
+-- ============ ETF / 指数（对标基金公司 ETF skill，2026-11-10） ============
+CREATE TABLE IF NOT EXISTS etf_profile_data (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_date DATE NOT NULL, code TEXT NOT NULL, name TEXT,
+    price REAL, iopv REAL, premium_discount_pct REAL,
+    volume REAL, amount REAL,
+    scale REAL, outstanding_shares REAL,
+    fee_rate_mgmt REAL, fee_rate_custody REAL,
+    tracking_error REAL, listed_date TEXT,
+    raw_data TEXT, ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(trade_date, code)
+);
+CREATE INDEX IF NOT EXISTS idx_etf_profile_lookup ON etf_profile_data(trade_date DESC, code);
+
+CREATE TABLE IF NOT EXISTS etf_margin_data (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_date DATE NOT NULL, code TEXT NOT NULL, name TEXT,
+    margin_buy_balance REAL, margin_sell_balance REAL,
+    margin_net_balance REAL,
+    raw_data TEXT, ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(trade_date, code)
+);
+CREATE INDEX IF NOT EXISTS idx_etf_margin_lookup ON etf_margin_data(trade_date DESC, code);
+
+CREATE TABLE IF NOT EXISTS index_valuation_data (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_date DATE NOT NULL, index_code TEXT NOT NULL, index_name TEXT,
+    pe_ttm REAL, pe_mr REAL,
+    dividend_yield_total REAL, dividend_yield_paid REAL,
+    percentile_5y REAL,
+    raw_data TEXT, ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(trade_date, index_code)
+);
+CREATE INDEX IF NOT EXISTS idx_index_valuation_lookup ON index_valuation_data(index_code, trade_date DESC);
+
+CREATE TABLE IF NOT EXISTS index_constituents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    as_of_date DATE NOT NULL, index_code TEXT NOT NULL, index_name TEXT,
+    stock_code TEXT NOT NULL, stock_name TEXT, exchange TEXT,
+    weight REAL,
+    raw_data TEXT, ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(as_of_date, index_code, stock_code)
+);
+CREATE INDEX IF NOT EXISTS idx_index_cons_lookup ON index_constituents(index_code, stock_code, as_of_date DESC);
+CREATE INDEX IF NOT EXISTS idx_index_cons_stock ON index_constituents(stock_code, as_of_date DESC);

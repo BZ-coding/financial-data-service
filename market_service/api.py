@@ -2153,6 +2153,47 @@ async def get_detail(symbol: str = Query(..., description="标的代码（来自
         raise HTTPException(500, "详情读取失败")
 
 
+# ==================== ETF / 指数画像（对标基金公司 ETF skill，2026-11-10） ====================
+# 口径纪律：每个接口都带 as_of（数据日期）与 frequency（数据频率），
+# 防止 AI/用户把不同频率的数据混用（南方 ETFirst Skill 的核心经验）。
+
+@app.get("/api/v1/etf/profile")
+async def etf_profile(code: str = Query(None, description="ETF 代码，缺省=全市场最新快照"),
+                      trade_date: str = Query(None, description="数据日期 YYYY-MM-DD")):
+    """ETF 基础画像：价格 / IOPV / 折溢价 / 成交。频率：daily。"""
+    rows = db.get_etf_profile(code=code, trade_date=trade_date)
+    return {"count": len(rows), "frequency": "daily",
+            "as_of": (rows[0]["trade_date"] if rows else None), "items": rows}
+
+
+@app.get("/api/v1/index/valuation")
+async def index_valuation(index_code: str = Query(..., description="指数代码，如 000300")):
+    """指数估值：PE(TTM/MR) + 股息率 + 5年分位。频率：daily（中证官网口径）。"""
+    code = index_code.strip()
+    row = db.get_index_valuation(code) or db.get_index_valuation(code.lstrip("0") or code)
+    if not row:
+        raise HTTPException(404, f"暂无 {index_code} 的估值数据")
+    return row
+
+
+@app.get("/api/v1/index/constituents")
+async def index_constituents(index_code: str = Query(..., description="指数代码"),
+                             top: int = Query(10, description="取前 N 大权重")):
+    """指数前 N 大权重成份股。频率：weekly（中证官网月/周度更新）。"""
+    data = db.get_index_top_weights(index_code, limit=top)
+    if not data:
+        raise HTTPException(404, f"暂无 {index_code} 的成份股数据")
+    return data
+
+
+@app.get("/api/v1/stock/index-membership")
+async def stock_index_membership(symbol: str = Query(..., description="股票代码")):
+    """个股 → 所属指数（最新一期），带权重。频率：weekly。"""
+    rows = db.get_stock_index_membership(symbol)
+    return {"symbol": symbol, "count": len(rows), "frequency": "weekly",
+            "as_of": (rows[0]["as_of"] if rows else None), "items": rows}
+
+
 @app.get("/api/v1/stats")
 async def get_stats():
     """获取服务统计"""

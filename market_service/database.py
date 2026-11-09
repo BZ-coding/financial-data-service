@@ -178,6 +178,51 @@ class Database:
             )""")
             migrations.append("CREATE INDEX IF NOT EXISTS idx_dragon_tiger_lookup ON dragon_tiger_data(trade_date DESC, code)")
             migrations.append("CREATE INDEX IF NOT EXISTS idx_dragon_tiger_code ON dragon_tiger_data(code, trade_date DESC)")
+            migrations.append("""CREATE TABLE IF NOT EXISTS etf_profile_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_date DATE NOT NULL, code TEXT NOT NULL, name TEXT,
+                price REAL, iopv REAL, premium_discount_pct REAL,
+                volume REAL, amount REAL,
+                scale REAL, outstanding_shares REAL,
+                fee_rate_mgmt REAL, fee_rate_custody REAL,
+                tracking_error REAL, listed_date TEXT,
+                raw_data TEXT, ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(trade_date, code)
+            )""")
+            migrations.append("CREATE INDEX IF NOT EXISTS idx_etf_profile_lookup ON etf_profile_data(trade_date DESC, code)")
+
+            migrations.append("""CREATE TABLE IF NOT EXISTS etf_margin_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_date DATE NOT NULL, code TEXT NOT NULL, name TEXT,
+                margin_buy_balance REAL, margin_sell_balance REAL,
+                margin_net_balance REAL,
+                raw_data TEXT, ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(trade_date, code)
+            )""")
+            migrations.append("CREATE INDEX IF NOT EXISTS idx_etf_margin_lookup ON etf_margin_data(trade_date DESC, code)")
+
+            migrations.append("""CREATE TABLE IF NOT EXISTS index_valuation_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_date DATE NOT NULL, index_code TEXT NOT NULL, index_name TEXT,
+                pe_ttm REAL, pe_mr REAL,
+                dividend_yield_total REAL, dividend_yield_paid REAL,
+                percentile_5y REAL,
+                raw_data TEXT, ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(trade_date, index_code)
+            )""")
+            migrations.append("CREATE INDEX IF NOT EXISTS idx_index_valuation_lookup ON index_valuation_data(index_code, trade_date DESC)")
+
+            migrations.append("""CREATE TABLE IF NOT EXISTS index_constituents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                as_of_date DATE NOT NULL, index_code TEXT NOT NULL, index_name TEXT,
+                stock_code TEXT NOT NULL, stock_name TEXT, exchange TEXT,
+                weight REAL,
+                raw_data TEXT, ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(as_of_date, index_code, stock_code)
+            )""")
+            migrations.append("CREATE INDEX IF NOT EXISTS idx_index_cons_lookup ON index_constituents(index_code, stock_code, as_of_date DESC)")
+            migrations.append("CREATE INDEX IF NOT EXISTS idx_index_cons_stock ON index_constituents(stock_code, as_of_date DESC)")
+
 
         for stmt in migrations:
             try:
@@ -1726,6 +1771,164 @@ class Database:
                 ORDER BY change_pct DESC LIMIT ?
             """, (limit,))
         return [dict(r) for r in cur.fetchall()]
+
+
+    # ==================== ETF / INDEX (对标基金公司 ETF skill) ====================
+
+    def save_etf_profile(self, data_list: List[Dict[str, Any]]) -> int:
+        """批量保存 ETF 基础画像 (日频)"""
+        saved = 0
+        try:
+            for d in data_list:
+                self.conn.execute("""
+                    INSERT OR REPLACE INTO etf_profile_data (
+                        trade_date, code, name, price, iopv, premium_discount_pct,
+                        volume, amount, raw_data
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    d.get('trade_date'), d.get('code'), d.get('name'),
+                    d.get('price'), d.get('iopv'), d.get('premium_discount_pct'),
+                    d.get('volume'), d.get('amount'),
+                    json.dumps({'source': d.get('source')}, ensure_ascii=False)
+                ))
+                saved += 1
+            self.conn.commit()
+            return saved
+        except Exception as e:
+            logger.error(f"save_etf_profile 失败: {e}")
+            return saved
+
+    def get_etf_profile(self, code: Optional[str] = None, trade_date: Optional[str] = None) -> List[Dict[str, Any]]:
+        """ETF 基础画像（默认最新交易日；带 as_of 口径）"""
+        if trade_date:
+            cur = self.conn.execute(
+                "SELECT *, trade_date AS as_of, 'daily' AS frequency FROM etf_profile_data WHERE trade_date=?"
+                " ORDER BY amount DESC", (trade_date,))
+        else:
+            cur = self.conn.execute(
+                "SELECT *, trade_date AS as_of, 'daily' AS frequency FROM etf_profile_data"
+                " WHERE trade_date=(SELECT MAX(trade_date) FROM etf_profile_data)"
+                " ORDER BY amount DESC")
+        rows = [dict(r) for r in cur.fetchall()]
+        if code:
+            rows = [r for r in rows if r['code'] == code]
+        return rows
+
+    def save_etf_margin(self, data_list: List[Dict[str, Any]]) -> int:
+        saved = 0
+        try:
+            for d in data_list:
+                self.conn.execute("""
+                    INSERT OR REPLACE INTO etf_margin_data (
+                        trade_date, code, name, margin_buy_balance,
+                        margin_sell_balance, margin_net_balance, raw_data
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    d.get('trade_date'), d.get('code'), d.get('name'),
+                    d.get('margin_buy_balance'), d.get('margin_sell_balance'),
+                    d.get('margin_net_balance'),
+                    json.dumps({'source': d.get('source')}, ensure_ascii=False)
+                ))
+                saved += 1
+            self.conn.commit()
+            return saved
+        except Exception as e:
+            logger.error(f"save_etf_margin 失败: {e}")
+            return saved
+
+    def save_index_valuation(self, data_list: List[Dict[str, Any]]) -> int:
+        """保存指数估值；并计算 5 年分位（基于本表历史）"""
+        saved = 0
+        try:
+            for d in data_list:
+                pe = d.get('pe_ttm')
+                pct = None
+                if pe:
+                    row = self.conn.execute(
+                        "SELECT MIN(pe_ttm) lo, MAX(pe_ttm) hi FROM ("
+                        " SELECT pe_ttm FROM index_valuation_data"
+                        " WHERE index_code=? AND pe_ttm IS NOT NULL"
+                        " ORDER BY trade_date DESC LIMIT 1260)", (d['index_code'],)
+                    ).fetchone()
+                    lo, hi = (row['lo'], row['hi']) if row and row['lo'] and row['hi'] else (None, None)
+                    if lo and hi and hi > lo:
+                        pct = round((pe - lo) / (hi - lo) * 100, 1)
+                self.conn.execute("""
+                    INSERT OR REPLACE INTO index_valuation_data (
+                        trade_date, index_code, index_name, pe_ttm, pe_mr,
+                        dividend_yield_total, dividend_yield_paid, percentile_5y, raw_data
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    d.get('trade_date'), d.get('index_code'), d.get('index_name'),
+                    d.get('pe_ttm'), d.get('pe_mr'),
+                    d.get('dividend_yield_total'), d.get('dividend_yield_paid'),
+                    pct, json.dumps({'source': d.get('source'),
+                                     'frequency': d.get('frequency', 'daily')}, ensure_ascii=False)
+                ))
+                saved += 1
+            self.conn.commit()
+            return saved
+        except Exception as e:
+            logger.error(f"save_index_valuation 失败: {e}")
+            return saved
+
+    def get_index_valuation(self, index_code: str) -> Optional[Dict[str, Any]]:
+        cur = self.conn.execute(
+            "SELECT *, trade_date AS as_of, 'daily' AS frequency FROM index_valuation_data"
+            " WHERE index_code=? ORDER BY trade_date DESC LIMIT 1", (index_code,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def save_index_constituents(self, data_list: List[Dict[str, Any]]) -> int:
+        saved = 0
+        try:
+            for d in data_list:
+                self.conn.execute("""
+                    INSERT OR REPLACE INTO index_constituents (
+                        as_of_date, index_code, index_name, stock_code, stock_name,
+                        exchange, weight, raw_data
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    d.get('as_of_date'), d.get('index_code'), d.get('index_name'),
+                    d.get('stock_code'), d.get('stock_name'), d.get('exchange'),
+                    d.get('weight'), json.dumps({'source': d.get('source')}, ensure_ascii=False)
+                ))
+                saved += 1
+            self.conn.commit()
+            return saved
+        except Exception as e:
+            logger.error(f"save_index_constituents 失败: {e}")
+            return saved
+
+    def get_stock_index_membership(self, stock_code: str) -> List[Dict[str, Any]]:
+        """个股→所属指数（每指数取最新一期），带 as_of 与权重。"""
+        cur = self.conn.execute("""
+            SELECT c.index_code, c.index_name, c.stock_name, c.weight,
+                   c.as_of_date AS as_of, 'weekly' AS frequency
+            FROM index_constituents c
+            WHERE c.stock_code = ?
+              AND c.as_of_date = (
+                SELECT MAX(as_of_date) FROM index_constituents sub
+                WHERE sub.index_code = c.index_code)
+            ORDER BY c.weight DESC
+        """, (stock_code,))
+        return [dict(r) for r in cur.fetchall()]
+
+    def get_index_top_weights(self, index_code: str, limit: int = 10) -> Optional[Dict[str, Any]]:
+        cur = self.conn.execute(
+            "SELECT as_of_date FROM index_constituents WHERE index_code IN (?, ?)"
+            " ORDER BY as_of_date DESC LIMIT 1",
+            (index_code, index_code.lstrip("0") or index_code))
+        row = cur.fetchone()
+        if not row:
+            return None
+        as_of = row['as_of_date']
+        cur = self.conn.execute(
+            "SELECT stock_code, stock_name, weight FROM index_constituents"
+            " WHERE index_code IN (?, ?) AND as_of_date=? ORDER BY weight DESC LIMIT ?",
+            (index_code, index_code.lstrip("0") or index_code, as_of, limit))
+        return {"index_code": index_code, "as_of": as_of,
+                "frequency": "weekly", "items": [dict(r) for r in cur.fetchall()]}
 
     # ==================== DRAGON TIGER (Phase 2 新增) ====================
 
