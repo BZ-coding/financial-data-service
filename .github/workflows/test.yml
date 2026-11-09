@@ -27,6 +27,11 @@ jobs:
           pip install -r market_service/requirements.txt
           pip install pytest httpx
 
+      - name: Install fin-indicators (shared library repo)
+        run: |
+          git clone --depth 1 https://github.com/BZ-coding/fin-indicators.git /tmp/fin-indicators
+          pip install /tmp/fin-indicators
+
       - name: Import smoke test
         run: |
           python -c "import market_service; from market_service import api, database; print('imports OK')"
