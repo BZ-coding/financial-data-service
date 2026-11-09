@@ -498,7 +498,9 @@ async def get_data(
                 rows = db.get_announcements(symbol, days=days)
                 if not rows:
                     raise HTTPException(404, f"未找到 {symbol} 的公告数据")
-                return {"symbol": symbol, "items": rows, "count": len(rows), "days": days}
+                return {"symbol": symbol, "items": rows, "count": len(rows), "days": days,
+                        "as_of": (rows[-1].get("published") or rows[-1].get("trade_time") or rows[-1].get("nav_date")) if rows else None,
+                        "frequency": "daily"}
             elif data_type == "community":
                 days = 30
                 rows = db.get_community_posts(symbol, days=days)
@@ -588,10 +590,14 @@ async def get_history(
     try:
         if data_type == "nav":
             rows = db.get_nav_history(symbol, days)
-            return {"symbol": symbol, "data_type": "nav", "days": days, "items": rows}
+            return {"symbol": symbol, "data_type": "nav", "days": days, "items": rows,
+                    "as_of": (str(rows[-1].get("nav_date")) if rows else None),
+                    "frequency": "daily"}
         elif data_type == "price":
             rows = db.get_price_history(symbol, days)
-            return {"symbol": symbol, "data_type": "price", "days": days, "items": rows}
+            return {"symbol": symbol, "data_type": "price", "days": days, "items": rows,
+                    "as_of": (rows[0].get("trade_time") if rows else None),
+                    "frequency": "intraday_snapshot"}
         else:
             raise HTTPException(400, f"不支持的历史数据类型: {data_type}")
     except Exception as e:
