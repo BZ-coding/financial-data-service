@@ -12,6 +12,15 @@ import json
 import asyncio
 import re
 import requests
+# ── IPv6 出口修复（2026-11-03 运维手定位）─────────────────────────────────
+# 根因：push2/push2delay/push2his 的 AAAA 指向 Azure Traffic Manager 边缘，
+# 从本机走 IPv6 全部 SSL EOF（IPv4 同域名 200 稳定）；urllib3 按 getaddrinfo
+# 顺序优先 IPv6 → 55 连败、12 小时断更。运维手实测 HAS_IPV6=False 后
+# 三个域全部 200。这里在**模块加载时**统一关闭 urllib3 的 IPv6 依赖——
+# 采集器所有 requests 调用都经过本模块，一处生效。
+# （不用 /etc/gai.conf 系统级改优先——那影响全机服务，运维侧明确不建议。）
+import urllib3.util.connection as _u3conn
+_u3conn.HAS_IPV6 = False
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone, timedelta
 import logging
@@ -308,6 +317,8 @@ class CommunityEnhancedCollector(BaseCollector):
     def _fetch_main_fund_rank(self, top_n: int = 20, timeout: int = 5, max_retries: int = 3) -> Optional[List[Dict[str, Any]]]:
         """
         主力资金净流入 Top N (东方财富 push2delay 接口, mcp-eastmoney 同源)
+        2026-11-03 扩容（项 ④）：上游单页上限 pz=100（实测 pz>100 仍返 100），
+        top_n>100 自动 pn 翻页（每页间隔 2s 限速）；5563 条全量可分 56 页拉齐。
         fields: f12=code, f14=name, f2=price, f3=change_pct×100,
                 f62=main_net_inflow(元), f184=main_net_pct×100,
                 f66=super_large, f70=large, f76=medium, f78=small
@@ -322,18 +333,39 @@ class CommunityEnhancedCollector(BaseCollector):
         try:
             import time as _time
             fs = "m:0+t:6,m:0+t:13,m:0+t:80,m:1+t:2,m:1+t:23,m:1+t:8"
-            ts = int(_time.time() * 1000)
-            # 用 push2delay (mcp-eastmoney 同款), push2 经常被封
-            url = (
-                f"https://push2delay.eastmoney.com/api/qt/clist/get"
-                f"?pn=1&pz={top_n}&po=1&np=1&fltt=2&invt=2"
-                f"&fid=f62&fs={fs}"
-                f"&fields=f12,f14,f2,f3,f62,f184,f66,f70,f76,f78"
-                f"&req_trace={ts}&_={ts}"
-            )
-            resp = self._get_with_backoff(url, headers={"Referer": "https://quote.eastmoney.com/"}, timeout=timeout, max_retries=max_retries)
-            data = resp.json()
-            diff = (data.get("data") or {}).get("diff") or []
+            # 单页上限 100（实测 pz=100/300/500 都只返 100）→ top_n>100 分页翻
+            pages = max(1, -(-top_n // 100))
+            pz = min(top_n, 100)
+            diff = []
+            upstream_total = None
+            for pn in range(1, pages + 1):
+                ts = int(_time.time() * 1000)
+                url = (
+                    f"https://push2delay.eastmoney.com/api/qt/clist/get"
+                    f"?pn={pn}&pz={pz}&po=1&np=1&fltt=2&invt=2"
+                    f"&fid=f62&fs={fs}"
+                    f"&fields=f12,f14,f2,f3,f62,f184,f66,f70,f76,f78"
+                    f"&req_trace={ts}&_={ts}"
+                )
+                resp = self._get_with_backoff(url, headers={"Referer": "https://quote.eastmoney.com/"}, timeout=timeout, max_retries=max_retries)
+                data = resp.json()
+                d = data.get("data")   # ⚠️ 上游限流时 data=None（HTTP 200 + null）
+                if d is None or not d.get("diff"):
+                    # P3：HTTP 200 但 data=null = 上游限流半批返回
+                    # → 已拿到的部分当失败（return None），不能当"最后一页"入库
+                    self.logger.warning(
+                        f"_fetch_main_fund_rank 第 {pn} 页 data=None（上游限流），"
+                        f"已拿 {len(diff)} 条 → 判为失败")
+                    return None
+                if upstream_total is None:
+                    upstream_total = d.get("total")   # ⚠️ 在 d 层取，不是 data 层
+                diff.extend(d.get("diff") or [])
+                if len(d.get("diff") or []) < pz:
+                    break                      # 最后一页
+                if pn < pages:
+                    _time.sleep(2)             # 限速节奏（上游限流敏感）
+            self.logger.info(f"_fetch_main_fund_rank 获取 {len(diff)} 条"
+                             f"（{pages} 页，上游 total={upstream_total}）")
             items = []
             for i, r in enumerate(diff, start=1):
                 # f2=价格(元), f3=涨跌幅×100(%), f62=主力净流入(元), f184=主力净流入占比×100(%)
@@ -365,21 +397,37 @@ class CommunityEnhancedCollector(BaseCollector):
         fields: f12=code, f14=name, f3=change_pct×100,
                 f62=main_net_inflow(元), f184=main_net_pct×100,
                 f128=leading_stock, f136=leading_change_pct×100
+        2026-11-03 扩容（与 main_fund_rank 同模式）：top_n>100 自动 pn 翻页，
+        上游 total：行业 496 / 概念 531，全量可拉。
         """
         try:
             import time as _time
             fs = "m:90+t:2" if kind == "industry" else "m:90+t:3"
-            ts = int(_time.time() * 1000)
-            url = (
-                f"https://push2delay.eastmoney.com/api/qt/clist/get"
-                f"?pn=1&pz={top_n}&po=1&np=1&fltt=2&invt=2"
-                f"&fid=f62&fs={fs}"
-                f"&fields=f12,f14,f2,f3,f62,f184,f128,f136"
-                f"&req_trace={ts}&_={ts}"
-            )
-            resp = self._get_with_backoff(url, headers={"Referer": "https://quote.eastmoney.com/"}, timeout=timeout, max_retries=max_retries)
-            data = resp.json()
-            diff = (data.get("data") or {}).get("diff") or []
+            pages = max(1, -(-top_n // 100))
+            pz = min(top_n, 100)
+            diff = []
+            for pn in range(1, pages + 1):
+                ts = int(_time.time() * 1000)
+                url = (
+                    f"https://push2delay.eastmoney.com/api/qt/clist/get"
+                    f"?pn={pn}&pz={pz}&po=1&np=1&fltt=2&invt=2"
+                    f"&fid=f62&fs={fs}"
+                    f"&fields=f12,f14,f2,f3,f62,f184,f128,f136"
+                    f"&req_trace={ts}&_={ts}"
+                )
+                resp = self._get_with_backoff(url, headers={"Referer": "https://quote.eastmoney.com/"}, timeout=timeout, max_retries=max_retries)
+                data = resp.json()
+                d = data.get("data")
+                if d is None or not d.get("diff"):
+                    self.logger.warning(
+                        f"_fetch_sector_fund_flow({kind}) 第 {pn} 页 data=None（上游限流）")
+                    return None
+                batch = d.get("diff") or []
+                diff.extend(batch)
+                if len(batch) < pz:
+                    break
+                if pn < pages:
+                    _time.sleep(2)
             items = []
             for i, r in enumerate(diff, start=1):
                 items.append({

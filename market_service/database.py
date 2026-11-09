@@ -10,6 +10,19 @@ from datetime import datetime, date, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 import logging
+try:
+    # 包内导入（`market_service.database`）—— **根治后的正规做法**
+    from .safe_ops import safe_delete
+except ImportError:
+    # 平铺导入回退（`market_service/` 本身在 sys.path 上时）
+    #
+    # ⚠️ 2026-10-30 实测：只留平铺导入时，`import market_service.database`
+    #    直接 ModuleNotFoundError（safe_ops 与 database 同级、是**兄弟模块**，
+    #    不是包的子模块 → 不是 `market_service.safe_ops`）
+    #    → 这个模块只能靠「运行脚本时 sys.path[0] 恰好是 market_service/」才导得进来。
+    #    两种写法并存 → 换个入口就崩（2026-10-30 market-db-cleanup 首跑失败即此类）。
+    from safe_ops import safe_delete
+# 统一安全删除（影响行数上限保护）
 
 logger = logging.getLogger(__name__)
 
@@ -622,6 +635,21 @@ class Database:
             END ASC
         """, (symbol, start_time))
         return [dict(row) for row in cur.fetchall()]
+    def get_daily_history(self, symbol: str, days: int = 60) -> List[Dict[str, Any]]:
+        """日 K 历史（daily_data：东财日线回填/增量，见 scripts/backfill_daily_kline.py）。
+
+        ⚠️ A3 时区口径：trade_date 是 DATE 型（本地交易日历），cutoff 按本地日历天
+           计算，与 started_at 等本地列同一口径；daily_data **不在清理策略里**
+           （指标需要 ≥60 根，做 90 天清理会把它截短）。
+           升序返回，与 bars_from_intraday 的输出方向一致。
+        """
+        cutoff = (datetime.now(TZ) - timedelta(days=days)).strftime("%Y-%m-%d")
+        cur = self.conn.execute(
+            "SELECT trade_date, open, high, low, close, vol, amount"
+            " FROM daily_data WHERE symbol = ? AND trade_date >= ?"
+            " ORDER BY trade_date ASC", (symbol, cutoff))
+        return [dict(row) for row in cur.fetchall()]
+
 
     def get_latest_price(self, symbol: str, source: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """获取最新行情，直接返回最新数据
@@ -876,7 +904,9 @@ class Database:
             return False
 
     def insert_fund_flow(self, data: Dict[str, Any]) -> bool:
-        """插入主力资金/板块资金流数据"""
+        """插入主力资金/板块资金流数据（INSERT OR REPLACE：同 rank_data 重采集时
+        UPDATE 值而不是静默跳过——原来 OR IGNORE 导致 496 条采集全部被静默吞掉，
+        collection_log 谎报 items_stored=496，表里一行都没有）"""
         try:
             # 解析 "12.34亿" 格式的字符串为浮点 (单位元)
             def parse_amount(s):
@@ -891,7 +921,7 @@ class Database:
                 except: return None
 
             self.conn.execute("""
-                INSERT OR IGNORE INTO fund_flow_data (
+                INSERT OR REPLACE INTO fund_flow_data (
                     source, flow_type, sector_kind, rank_no,
                     symbol, name, price, change_pct,
                     main_net_inflow, main_net_pct,
@@ -1113,8 +1143,8 @@ class Database:
 
     def delete_subscription(self, sub_id: int) -> bool:
         """删除订阅"""
-        n = self._dml("DELETE FROM subscriptions WHERE id = ?", (sub_id,))
-        self.conn.commit()
+        n = safe_delete(self.conn, "DELETE FROM subscriptions WHERE id = ?", (sub_id,),
+                        max_rows=1, reason=f"删除订阅 id={sub_id}")
         return n > 0
 
     def get_all_subscriptions(self) -> List[Dict[str, Any]]:
@@ -1221,7 +1251,12 @@ class Database:
         self.conn.commit()
 
     def get_recent_errors(self, hours: int = 1) -> List[Dict[str, Any]]:
-        """获取最近N小时的错误日志"""
+        """获取最近N小时的错误日志
+
+        ⚠️ A3 时区口径：collection_log.started_at 由本函数同文件的 insert 写入，
+           用 datetime.now(TZ)（本地 Asia/Shanghai）；这里 cutoff 也用本地，
+           **本地对本地，一致**。不要"顺手"改成 UTC——那是另一种口径混用。
+        """
         start = datetime.now(TZ) - timedelta(hours=hours)
         cur = self.conn.execute("""
             SELECT * FROM collection_log
@@ -1246,9 +1281,12 @@ class Database:
         active_subs = cur.fetchone()['cnt']
 
         # 最近24小时成功率
+        # ⚠️ A3：collection_log.started_at 存**本地**时间，而 SQLite datetime('now')
+        #    是 **UTC** —— 直接用会把"24 小时"错算成 32 小时（UTC 比本地早 8h，
+        #    早 8h 的时间戳更小 → 更多行 ≥ 它）。必须加 'localtime' 对齐写入口径。
         cur = self.conn.execute("""
             SELECT status, COUNT(*) as cnt FROM collection_log
-            WHERE started_at >= datetime('now', '-1 day')
+            WHERE started_at >= datetime('now', 'localtime', '-1 day')
             GROUP BY status
         """)
         status_counts = {row['status']: row['cnt'] for row in cur.fetchall()}
@@ -1284,16 +1322,30 @@ class Database:
     #   ② **collection_log 保留期硬编码 30 天**，不读配置 → 无法调整。
     #   ③ **不覆盖几个最大的表**（news_aggregator_data 756MB / mmx_search_data 265MB），
     #      而 collection_log 连索引合计 435MB —— 库体积大头完全没被管。
+    # ⚠️⚠️ A3（2026-11-03 批评家）：最后一列是**时间列的时区口径标注**，必须显式。
+    #    同一个 cutoff 函数没法同时服务两种口径的列——本项目同一张库里两种口径都有：
+    #      utc   = SQLite DEFAULT CURRENT_TIMESTAMP / 应用写 datetime.now(timezone.utc)
+    #              （恒 UTC，与本地差 8 小时）
+    #      local = 应用写本地时间 datetime.now(TZ)（行情时间、调度时间、DATE 交易日历）
+    #    口径是 2026-11-03 逐列实测 MAX(col) 与当时 UTC/本地时间对照定下的：
+    #      started_at 11:38=本地 ✓ │ trade_time 15:00=本地收盘 ✓ │ ingested_at 03:14=UTC ✓
+    #      trade_date=DATE 按本地交易日历 │ estimate_nav/aggregator/mmx/fund_flow=UTC ✓
     CLEANUP_POLICIES = [
-        ("collection_log",      "started_at",  "log_days",           30, "采集日志（表+索引合计 435MB）"),
+        ("collection_log",      "started_at",  "log_days",           30, "采集日志（表+索引合计 435MB）", "local"),
         # price_data 默认 60 → 90 天：dsa-mcp 的 analyze_trend(days=60) 要 60 天窗口，
         # 保留期正好卡在 60 天会在边界删掉刚采到的数据 → 留 30 天余量
-        ("price_data",          "trade_time",  "price_days",         90, "实时行情快照（dsa-mcp 需 60 天窗口，留 30 天余量）"),
-        ("news_data",           "ingested_at", "news_days",          30, "个股新闻（link UNIQUE，删后可重采）"),
-        ("minute_data",         "trade_date",  "minute_days",        60, "分钟K线"),
-        ("estimate_nav_data",   "ingested_at", "estimate_nav_days",  30, "盘中估算净值"),
-        ("news_aggregator_data","ingested_at", "aggregator_days",    14, "全网聚合新闻（单行可达 30KB）"),
-        ("mmx_search_data",     "collected_at","mmx_search_days",    90, "财经搜索结果（长期无消费）"),
+        ("price_data",          "trade_time",  "price_days",         90, "实时行情快照（dsa-mcp 需 60 天窗口，留 30 天余量）", "local"),
+        ("news_data",           "ingested_at", "news_days",          30, "个股新闻（link UNIQUE，删后可重采）", "utc"),
+        # minute_data.trade_date 是 DATE 型（纯日期）：与带时间的 cutoff 比较按
+        # 字符串字典序，边界日整天一起删——按本地交易日历口径，符合预期。
+        ("minute_data",         "trade_date",  "minute_days",        60, "分钟K线", "local"),
+        ("estimate_nav_data",   "ingested_at", "estimate_nav_days",  30, "盘中估算净值", "utc"),
+        ("news_aggregator_data","ingested_at", "aggregator_days",    14, "全网聚合新闻（单行可达 30KB）", "utc"),
+        ("mmx_search_data",     "collected_at","mmx_search_days",    90, "财经搜索结果（长期无消费）", "utc"),
+        # 2026-11-03（项 ⑥）：fund_flow_data 原来不在保留列表——top_n 扩容后
+        # 300 个股 + 992 板块 × ~6 批/日 ≈ 7750 行/天 ≈ 550MB/年，无限增长。
+        # 90 天与前值分析窗口匹配；更早的批次只对历史回测有用。
+        ("fund_flow_data",      "collected_at","fund_flow_days",     90, "资金流（个股+板块，top_n 扩容后 ~7750 行/日）", "utc"),
     ]
 
     def cleanup_old_data(self, retention_days: Dict[str, int], dry_run: bool = False) -> Dict[str, Any]:
@@ -1306,26 +1358,47 @@ class Database:
         Returns:
             {"deleted": {表名: 行数}, "cutoffs": {表名: 截止时间}, "dry_run": bool}
         """
-        now = datetime.now(TZ)
+        # A3：cutoff 按**列的口径**取——UTC 列用 UTC now，本地列用本地 now。
+        # 此前一刀切 UTC：对 local 列（collection_log.started_at / price_data.trade_time）
+        # 会少删 8 小时窗口（保守方向，无数据损失，但保留期悄悄变长 8h）。
+        now_utc = datetime.now(timezone.utc)
+        now_local = datetime.now(TZ)
         deleted_counts = {}
         cutoffs = {}
 
-        for table, time_col, cfg_key, default_days, desc in self.CLEANUP_POLICIES:
+        for table, time_col, cfg_key, default_days, desc, tz in self.CLEANUP_POLICIES:
             days = int(retention_days.get(cfg_key, default_days))
+            now = now_utc if tz == "utc" else now_local
             cutoff = now - timedelta(days=days)
             cutoff_s = cutoff.strftime("%Y-%m-%d %H:%M:%S")
-            cutoffs[table] = {"cutoff": cutoff_s, "retention_days": days, "desc": desc}
+            cutoffs[table] = {"cutoff": cutoff_s, "retention_days": days,
+                              "desc": desc, "tz": tz}
             try:
                 if dry_run:
                     cur = self.conn.execute(
                         f"SELECT COUNT(*) FROM {table} WHERE {time_col} < ?", (cutoff_s,))
                     n = cur.fetchone()[0]
                 else:
-                    # ⚠️ 用 _dml（total_changes 增量 + 唯一化 SQL），
-                    #    不用 rowcount / SELECT changes()：Python 3.12+ 的
-                    #    statement cache 会让计数误报 0，且同 SQL 第二次可能不执行
-                    n = self._dml(
-                        f"DELETE FROM {table} WHERE {time_col} < ?", (cutoff_s,))
+                    # ⚠️ 2026-10-29 加"影响行数上限"护栏：
+                    #    先数出**期望删除量**，再以它为上限删除；若实际删除数与期望
+                    #    不符（并发写入/判据漂移）→ **自动回滚**。
+                    #    （2026-10-29 订阅误删事故 = LIKE 通配符全表命中，无报错无告警
+                    #      —— 这类护栏是流程里缺的一环。）
+                    expected = self.conn.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE {time_col} < ?", (cutoff_s,)
+                    ).fetchone()[0]
+                    # NOTE: expect_rows (exact expectation), not max_rows:
+                    #   purging history can legitimately delete tens of thousands of rows;
+                    #   max_rows is bounded by the global fallback (HARD_MAX_ROWS=1000) and
+                    #   would misfire (it would roll back a legitimate purge). expect_rows
+                    #   means it must delete EXACTLY this many rows; any mismatch
+                    #   (concurrent write / predicate drift) -> rollback.
+                    n = safe_delete(
+                        self.conn,
+                        f"DELETE FROM {table} WHERE {time_col} < ?", (cutoff_s,),
+                        expect_rows=int(expected),
+                        reason=f"purge expired {table} (expect {expected} rows)",
+                    )
                 deleted_counts[table] = n
             except Exception as e:
                 # ⚠️ 不再静默失败：单表失败要明确记录，其余表继续
@@ -1436,8 +1509,8 @@ class Database:
     def remove_failed_collection(self, fail_id: int) -> bool:
         """删除限频重试记录（重试成功后调用）"""
         try:
-            self.conn.execute("DELETE FROM failed_collections WHERE id = ?", (fail_id,))
-            self.conn.commit()
+            safe_delete(self.conn, "DELETE FROM failed_collections WHERE id = ?", (fail_id,),
+                        max_rows=1, reason=f"删除限频重试记录 id={fail_id}")
             return True
         except Exception as e:
             logger.error(f"remove_failed_collection 失败: {e}")

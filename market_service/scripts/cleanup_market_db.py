@@ -31,11 +31,25 @@ from pathlib import Path
 # 项目根 = market_service/ 的上一级
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
+# market_service/ 目录本身也要在 sys.path 上：
+#   2026-10-30 根治后，`market_service/database.py` 与 `market_service/api.py`
+#   已改成**包内相对导入优先**（`from .safe_ops import safe_delete`，
+#   平铺导入只作回退）→ 主路径不再依赖这一行。
+#   但**回退分支仍需要它**：平铺导入（`from safe_ops import ...`）只有在
+#   market_service/ 本身在 sys.path 上时才解析得到（safe_ops 是兄弟模块）。
+#   → 两条路径都留着：包内相对导入走主路，平铺回退走保底。
+#   无论从哪个目录、用哪种方式直接跑本脚本，导入都能解析 → 不再依赖
+#   systemd unit 的 Environment=PYTHONPATH（那只是止血期的过渡写法）。
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from market_service.database import Database, TZ  # noqa: E402
 
 DEFAULT_RETENTION = {
     "log_days": 30, "price_days": 90, "news_days": 30, "minute_days": 60,
     "estimate_nav_days": 30, "aggregator_days": 14, "mmx_search_days": 90,
+    # 2026-11-03（项 ⑥）：fund_flow_data 原来不在保留列表——top_n 扩容后
+    # 300 个股 + 992 板块 × ~6 批/日 ≈ 7750 行/天 ≈ 550MB/年，无限增长。
+    # 90 天与前值分析窗口匹配；更早的批次只对历史回测有用。
+    "fund_flow_days": 90,
 }
 
 
@@ -64,7 +78,7 @@ def main():
     print(f"当前大小: {before:.1f} MB")
     print(f"保留期配置: {ret}\n")
 
-    result = db.cleanup_old_data(ret, dry_run=not args.apply)
+    result = db.cleanup_old_data(ret, dry_run=True)  # 【只统计，不删除】
     print(f"{'表':24s} {'保留':>5s} {'截止':20s} {'可删':>12s}")
     print("-" * 68)
     total = 0
@@ -83,21 +97,52 @@ def main():
         db.close()
         return 0
 
-    # 备份 collection_log（最大的表）
-    bak_dir = db_path.parent / "backups"
-    bak_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
-    bak = bak_dir / f"collection_log_{stamp}.jsonl"
-    print(f"→ 备份 collection_log → {bak}")
-    rows = db.conn.execute(
-        "SELECT id, source, data_type, status, error_message, started_at FROM collection_log").fetchall()
-    with open(bak, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(dict(r), ensure_ascii=False) + "\n")
-    print(f"  已备份 {len(rows):,} 行")
+    # ⚠️ 2026-10-31 修正（批评家）：下面这两段原来**先真删一遍再打印表格、
+    #    备份完又真删第二遍**（cleanup_old_data 在 dry_run=not args.apply 时
+    #    已经真删了）。后果：
+    #      · 表格打印的是**第一次真删的行数**（看起来像"可删清单"）
+    #      · 备份发生在第一次删除之后 → 备份的是"删完剩下的"（旧数据没备到！）
+    #      · 最后打印的"删除完成"是**第二次调用** → 几乎恒为全 0，
+    #        被误读成"删除全部失败 / expect_rows 回滚"（2026-10-30 排查即栽在这）
+    #    现在改为：开头 dry_run=True 只统计 → 打印 → 确认真删模式时
+    #    【先备份、再一次性真删】，表格里的数字只是统计，与删除动作分离。
+    if args.apply:
+        logger = logging.getLogger("market-cleanup")
+        if not logger.handlers:
+            _h = logging.StreamHandler()
+            _h.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+            logger.addHandler(_h)
+            logger.setLevel(logging.INFO)
+        # 备份 collection_log（最大的表）—— 必须在**删除之前**
+        bak_dir = db_path.parent / "backups"
+        bak_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
+        bak = bak_dir / f"collection_log_{stamp}.jsonl"
+        print(f"→ 备份 collection_log → {bak}")
+        rows = db.conn.execute(
+            "SELECT id, source, data_type, status, error_message, started_at FROM collection_log").fetchall()
+        with open(bak, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(dict(r), ensure_ascii=False) + "\n")
+        print(f"  已备份 {len(rows):,} 行")
 
-    result = db.cleanup_old_data(ret, dry_run=False)
-    print(f"\n→ 删除完成: {result['deleted']}")
+        # 一次性真删（内部对每张表仍是 COUNT → expect_rows 精确护栏 → DELETE）
+        result = db.cleanup_old_data(ret, dry_run=False)
+        # 审计：删除前后行数 + 各表实际删除数 + cutoff（批评家：删数据的操作必须有可审计记录）
+        import logging
+        _cl = logging.getLogger("market.cleanup")
+        if not _cl.handlers:
+            _ch = logging.StreamHandler()
+            _ch.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+            _cl.addHandler(_ch)
+            _cl.setLevel(logging.INFO)
+        _cl.info("清理审计: 删除前库大小=%.1fMB 删除后库大小=%.1fMB "
+                 "cutoff配置=%s 实际删除=%s 合计=%d行",
+                 before, db_size_mb(db_path), ret, result["deleted"], total)
+        print(f"\n→ 删除完成: {result['deleted']}")
+    else:
+        print("→ （未进入真删模式）")
+
     after = db_size_mb(db_path)
     print(f"→ 当前大小: {before:.1f} MB → {after:.1f} MB（磁盘回收需 VACUUM）")
     db.close()

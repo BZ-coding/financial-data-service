@@ -8,9 +8,18 @@ import logging
 from pathlib import Path
 
 # 添加项目路径
-project_root = Path(__file__).parent.parent
+#
+# ⚠️ 2026-10-30 修正：**差了一层**。
+#   原来插的是 `Path(__file__).parent.parent` = `market_service/`，
+#   但下面 `from market_service.database import ...` 需要的是**仓库根**
+#   （`market_service` 包的父目录）→ 直接跑本脚本必然
+#   ModuleNotFoundError: No module named 'market_service'。
+#   两个路径都插：仓库根（给 `market_service.*` 包导入用）+
+#   market_service/（给 database.py 的平铺回退分支用）。
 import sys
-sys.path.insert(0, str(project_root))
+_project_root = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_project_root))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from market_service.database import Database
 from market_service.scheduler import Scheduler
