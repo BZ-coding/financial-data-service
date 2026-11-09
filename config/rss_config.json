@@ -1,0 +1,35 @@
+{
+  "sources": [
+    {
+      "name": "akshare财经快讯",
+      "type": "akshare",
+      "module": "stock_news_em",
+      "keywords": ["基金", "A股", "红利", "天弘", "净值", "涨跌", "资金", "行业", "重仓", "持股"],
+      "priority": "high"
+    },
+    {
+      "name": "akshare央视新闻",
+      "type": "akshare",
+      "module": "news_cctv",
+      "keywords": ["金融", "经济", "央行", "证监会", "国务院", "政策", "楼市", "股市"],
+      "priority": "normal"
+    },
+    {
+      "name": "36氪财经",
+      "type": "rss",
+      "url": "https://36kr.com/feed",
+      "keywords": ["基金", "投资", "理财", "股票", "IPO", "融资", "市场", "金融科技", "科技公司", "IPO"],
+      "priority": "high"
+    },
+    {
+      "name": "新浪财经A股",
+      "type": "rss",
+      "url": "https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2509&k=&num=50&page=1",
+      "keywords": ["基金", "A股", "央行", "证监会", "美联储", "加息", "降息", "市场", "股票", "上市公司", "业绩", "分红"],
+      "priority": "high"
+    }
+  ],
+  "push_targets": {
+    "wechat": "o9cq804XYg6ju77g8QJd_73jVIs8@im.wechat"
+  }
+}

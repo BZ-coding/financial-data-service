@@ -1,0 +1,16 @@
+[Unit]
+Description=8084 行情数据新鲜度探针（每 30 分钟）
+After=market-data-service.service
+Wants=market-data-service.service
+
+[Service]
+Type=oneshot
+# 用服务自己的 venv 解释器：探针要 import akshare 取交易日历
+ExecStart=/home/zsd/financial-data-service/market_service/venv/bin/python3.14 /home/zsd/financial-data-service/market_service/market_data_freshness.py
+WorkingDirectory=/home/zsd/financial-data-service
+# 探针自己写日志到 logs/market-data-freshness.log，这里只兜底 stdout
+StandardOutput=append:/home/zsd/financial-data-service/logs/market-data-freshness.log
+StandardError=append:/home/zsd/financial-data-service/logs/market-data-freshness.log
+# 退出码 1 = 检测到问题（探针内部已推飞书），不算 systemd 故障
+SuccessExitStatus=0 1
+TimeoutStartSec=300

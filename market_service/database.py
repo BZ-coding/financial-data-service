@@ -1,0 +1,1852 @@
+#!/usr/bin/env python3
+"""
+数据库访问层
+使用SQLite，提供类型化的CRUD操作
+"""
+
+import sqlite3
+import json
+from datetime import datetime, date, timezone, timedelta
+from typing import Optional, List, Dict, Any
+from pathlib import Path
+import logging
+try:
+    # 包内导入（`market_service.database`）—— **根治后的正规做法**
+    from .safe_ops import safe_delete
+except ImportError:
+    # 平铺导入回退（`market_service/` 本身在 sys.path 上时）
+    #
+    # ⚠️ 2026-10-30 实测：只留平铺导入时，`import market_service.database`
+    #    直接 ModuleNotFoundError（safe_ops 与 database 同级、是**兄弟模块**，
+    #    不是包的子模块 → 不是 `market_service.safe_ops`）
+    #    → 这个模块只能靠「运行脚本时 sys.path[0] 恰好是 market_service/」才导得进来。
+    #    两种写法并存 → 换个入口就崩（2026-10-30 market-db-cleanup 首跑失败即此类）。
+    from safe_ops import safe_delete
+# 统一安全删除（影响行数上限保护）
+
+logger = logging.getLogger(__name__)
+
+# 时区：东8区
+TZ = timezone(timedelta(hours=8))
+
+def adapt_datetime(ts: datetime) -> str:
+    """SQLite适配器：datetime -> 'YYYY-MM-DD HH:MM:SS'
+
+    用 SQLite 期望的格式 (空格分隔, 无 timezone 后缀), 否则 SQLite 的 datetime()
+    静默解析失败 (丢掉 T 和 timezone, 倒退 7 小时), 导致 get_due_subscriptions
+    比较出错, 订阅每 60s tick 都被认成 due (frequency_min 失效).
+    """
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=TZ)
+    return ts.strftime('%Y-%m-%d %H:%M:%S')
+
+def convert_datetime(s: bytes) -> datetime:
+    """SQLite转换器：ISO8601 -> datetime"""
+    dt_str = s.decode('utf-8')
+    # 处理带Z的UTC时间
+    if dt_str.endswith('Z'):
+        dt_str = dt_str[:-1] + '+00:00'
+    return datetime.fromisoformat(dt_str).astimezone(TZ)
+
+# 注册适配器
+sqlite3.register_adapter(datetime, adapt_datetime)
+sqlite3.register_converter("TIMESTAMPTZ", convert_datetime)
+
+class Database:
+    def __init__(self, db_path: str = "data/market.db"):
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(
+            self.db_path,
+            detect_types=sqlite3.PARSE_DECLTYPES,
+            timeout=30,
+            check_same_thread=False  # 允许多线程（需配合锁）
+        )
+        self.conn.row_factory = sqlite3.Row
+        self._enable_wal()
+        self.init_tables()
+
+    def _enable_wal(self):
+        """启用WAL模式，提高并发性能"""
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
+        self.conn.commit()
+
+    def init_tables(self):
+        """执行schema.sql建表（含迁移）"""
+        schema_path = Path(__file__).parent / "schema.sql"
+        with open(schema_path, 'r', encoding='utf-8') as f:
+            sql = f.read()
+        try:
+            self.conn.executescript(sql)
+            self.conn.commit()
+            logger.info(f"数据库初始化完成: {self.db_path}")
+        except Exception as e:
+            logger.error(f"SQL执行失败: {e}")
+            # 打印前几行帮助调试
+            lines = sql.split(';')
+            for i, line in enumerate(lines[:10], 1):
+                logger.error(f"第{i}行: {line.strip()}")
+            raise
+
+        # ========== 数据库迁移 ==========
+        # 检查 subscriptions 表是否有新增列
+        cur = self.conn.execute("PRAGMA table_info(subscriptions)")
+        existing_cols = [row[1] for row in cur.fetchall()]
+        migrations = []
+        if 'trading_hours_only' not in existing_cols:
+            migrations.append("ALTER TABLE subscriptions ADD COLUMN trading_hours_only BOOLEAN DEFAULT FALSE")
+        if 'backup_sources' not in existing_cols:
+            migrations.append("ALTER TABLE subscriptions ADD COLUMN backup_sources TEXT")
+
+        # 建表迁移（如果表不存在）
+        cur = self.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='estimate_nav_data'")
+        if not cur.fetchone():
+            migrations.append("""CREATE TABLE estimate_nav_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL DEFAULT 'fundgz',
+                symbol TEXT NOT NULL,
+                fund_name TEXT,
+                nav_date DATE NOT NULL,
+                dwjz REAL,
+                estimate_nav REAL NOT NULL,
+                estimate_growth REAL,
+                estimate_time TEXT NOT NULL,
+                raw_data TEXT,
+                ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(source, symbol, estimate_time)
+            )""")
+            migrations.append("CREATE INDEX idx_est_nav_lookup ON estimate_nav_data(symbol, estimate_time DESC)")
+            migrations.append("CREATE INDEX idx_est_nav_cleanup ON estimate_nav_data(ingested_at)")
+
+        # 建表迁移：daily_data（Tushare 股票日线）
+        cur = self.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='daily_data'")
+        if not cur.fetchone():
+            migrations.append("""CREATE TABLE daily_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL DEFAULT 'tushare',
+                symbol TEXT NOT NULL,
+                trade_date DATE NOT NULL,
+                open REAL NOT NULL,
+                high REAL NOT NULL,
+                low REAL NOT NULL,
+                close REAL NOT NULL,
+                pre_close REAL,
+                change REAL,
+                pct_chg REAL,
+                vol REAL,
+                amount REAL,
+                raw_data TEXT,
+                ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(source, symbol, trade_date)
+            )""")
+            migrations.append("CREATE INDEX idx_daily_lookup ON daily_data(symbol, trade_date DESC)")
+            migrations.append("CREATE INDEX idx_daily_cleanup ON daily_data(ingested_at)")
+
+            # Phase 2 新增表 (commit 2)
+            migrations.append("""CREATE TABLE IF NOT EXISTS market_stats_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_date DATE UNIQUE NOT NULL,
+                sse_listed_count INTEGER, sse_stock_count INTEGER,
+                sse_total_mv REAL, sse_circ_mv REAL, sse_avg_pe REAL,
+                szse_stock_count INTEGER, szse_total_mv REAL, szse_circ_mv REAL, szse_amount REAL,
+                total_listed_count INTEGER, total_mv REAL,
+                raw_data TEXT, ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )""")
+            migrations.append("CREATE INDEX IF NOT EXISTS idx_market_stats_date ON market_stats_data(trade_date DESC)")
+
+            migrations.append("""CREATE TABLE IF NOT EXISTS limit_up_pool_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_date DATE NOT NULL, code TEXT NOT NULL,
+                name TEXT, price REAL, change_pct REAL, amount REAL,
+                limit_times INTEGER, first_limit_time TEXT, last_limit_time TEXT,
+                raw_data TEXT, ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(trade_date, code)
+            )""")
+            migrations.append("CREATE INDEX IF NOT EXISTS idx_limit_up_lookup ON limit_up_pool_data(trade_date DESC, change_pct DESC)")
+            migrations.append("CREATE INDEX IF NOT EXISTS idx_limit_up_cleanup ON limit_up_pool_data(ingested_at)")
+
+            migrations.append("""CREATE TABLE IF NOT EXISTS dragon_tiger_data (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_date DATE NOT NULL, code TEXT NOT NULL, name TEXT,
+                close_price REAL, change_pct REAL,
+                net_buy_amount REAL, buy_amount REAL, sell_amount REAL, total_amount REAL,
+                period TEXT, list_count INTEGER, inst_buy_net REAL,
+                raw_data TEXT, ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(trade_date, code, period)
+            )""")
+            migrations.append("CREATE INDEX IF NOT EXISTS idx_dragon_tiger_lookup ON dragon_tiger_data(trade_date DESC, code)")
+            migrations.append("CREATE INDEX IF NOT EXISTS idx_dragon_tiger_code ON dragon_tiger_data(code, trade_date DESC)")
+
+        for stmt in migrations:
+            try:
+                logger.info(f"执行迁移: {stmt}")
+                self.conn.execute(stmt)
+                self.conn.commit()
+            except Exception as e:
+                logger.error(f"迁移失败: {e}")
+
+    # ==================== NAV DATA ====================
+
+    def get_latest_nav(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """获取最新净值"""
+        cur = self.conn.execute("""
+            SELECT * FROM nav_data
+            WHERE symbol = ?
+            ORDER BY nav_date DESC, ingested_at DESC
+            LIMIT 1
+        """, (symbol,))
+        row = cur.fetchone()
+        if row:
+            return dict(row)
+        return None
+
+    def insert_nav(self, data: Dict[str, Any]) -> bool:
+        """插入净值数据，支持UPSERT（存在则更新）"""
+        try:
+            self.conn.execute("""
+                INSERT OR REPLACE INTO nav_data (
+                    source, symbol, nav_date, nav, acc_nav, change_pct,
+                    raw_data, ingested_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """, (
+                data['source'],
+                data['symbol'],
+                data['nav_date'],
+                data['nav'],
+                data.get('acc_nav'),
+                data.get('change_pct'),
+                json.dumps(data.get('raw', {}), ensure_ascii=False) if data.get('raw') else None
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"插入/更新净值失败: {e}")
+            return False
+
+    def insert_daily(self, data: Dict[str, Any]) -> bool:
+        """插入股票日线数据（Tushare daily）"""
+        try:
+            self.conn.execute("""
+                INSERT OR REPLACE INTO daily_data (
+                    source, symbol, trade_date, open, high, low, close,
+                    pre_close, change, pct_chg, vol, amount, raw_data,
+                    ingested_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """, (
+                data.get('source', 'tushare'),
+                data['symbol'],
+                data['trade_date'],
+                data['open'],
+                data['high'],
+                data['low'],
+                data['close'],
+                data.get('pre_close'),
+                data.get('change'),
+                data.get('pct_chg'),
+                data.get('vol'),
+                data.get('amount'),
+                json.dumps(data.get('raw', {}), ensure_ascii=False) if data.get('raw') else None
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"插入日线数据失败: {e}")
+            return False
+
+    def insert_hsgt(self, data: Dict[str, Any]) -> bool:
+        """插入沪深港通Top10数据（Tushare hsgt）"""
+        try:
+            self.conn.execute("""
+                INSERT OR REPLACE INTO hsgt_data (
+                    source, trade_date, ts_code, name, close,
+                    change, pct_chg, vol, amount, raw_data,
+                    ingested_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """, (
+                data.get('source', 'tushare'),
+                data.get('trade_date'),
+                data.get('ts_code') or data.get('symbol'),
+                data.get('name'),
+                data.get('close'),
+                data.get('change'),
+                data.get('pct_chg'),
+                data.get('vol'),
+                data.get('amount'),
+                json.dumps(data.get('raw', {}), ensure_ascii=False) if data.get('raw') else None
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"插入HSGT数据失败: {e}")
+            return False
+
+    def insert_stock_basic(self, data: Dict[str, Any]) -> bool:
+        """插入股票基本信息（Tushare stock_basic）"""
+        try:
+            self.conn.execute("""
+                INSERT OR REPLACE INTO stock_basic_data (
+                    source, symbol, ts_code, name, area,
+                    industry, market, list_date, raw_data,
+                    ingested_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """, (
+                data.get('source', 'tushare'),
+                data.get('symbol'),
+                data.get('ts_code'),
+                data.get('name'),
+                data.get('area'),
+                data.get('industry'),
+                data.get('market'),
+                data.get('list_date'),
+                json.dumps(data.get('raw', {}), ensure_ascii=False) if data.get('raw') else None
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"插入股票基本信息失败: {e}")
+            return False
+
+    def insert_news_aggregator(self, data: Dict[str, Any]) -> bool:
+        """插入全网聚合新闻（news_aggregator采集器）
+
+        ⚠️ 2026-10-26 瘦身：原来的 `raw_data` 存的是 `json.dumps(data)`，
+        而 data 里的 hackernews/github_trending/ths_news 三组 items
+        **已经被单独存进 hackernews_items / github_items / ths_items 三列**，
+        → **同一份 items 被完整存了两遍**。
+        实测：raw_data 列共 256.9 MB（14,925 行，平均 17.6 KB/行，最大 29.7 KB），
+              其中 items 的重复部分占绝大多数（抽样：11.2 KB/行 → 去掉 items 后 0.3 KB/行）。
+        而 **API 的 get_latest_news_aggregator 根本不读 raw_data**
+        （只 SELECT 6 个独立列 + ingested_at）→ raw_data 是纯冗余。
+
+        现在 raw_data 只保留**去掉 items 之后的元信息**（保留可追溯性，不再重复存储）。
+        预计该列从 256.9 MB 降到约 6 MB。
+        """
+        try:
+            # 去掉各源的 items（已单独存列），只留元信息
+            meta = {k: v for k, v in data.items() if k not in ("hackernews", "github_trending", "ths_news")}
+            for k in ("hackernews", "github_trending", "ths_news"):
+                if k in data and isinstance(data[k], dict):
+                    meta[k] = {kk: vv for kk, vv in data[k].items() if kk != "items"}
+            self.conn.execute("""
+                INSERT OR REPLACE INTO news_aggregator_data (
+                    source, collected_at,
+                    hackernews_count, hackernews_items,
+                    github_count, github_items,
+                    ths_count, ths_items,
+                    raw_data, ingested_at,
+                    caijing_count, caijing_items, caijing_status,
+                    eeo_count, eeo_items, eeo_status,
+                    sina_live_count, sina_live_items, sina_live_status,
+                    ths_hk_count, ths_hk_items, ths_hk_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP,
+                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                'news_aggregator',
+                data.get('collected_at', ''),
+                data.get('hackernews', {}).get('count', 0),
+                json.dumps(data.get('hackernews', {}).get('items', []), ensure_ascii=False),
+                data.get('github_trending', {}).get('count', 0),
+                json.dumps(data.get('github_trending', {}).get('items', []), ensure_ascii=False),
+                data.get('ths_news', {}).get('count', 0),
+                json.dumps(data.get('ths_news', {}).get('items', []), ensure_ascii=False),
+                json.dumps(meta, ensure_ascii=False),
+                # ★ 2026-10-28：四个财经快讯源 + 显式 status（source_unavailable/empty/ok）
+                data.get('caijing', {}).get('count', 0),
+                json.dumps(data.get('caijing', {}).get('items', []), ensure_ascii=False),
+                data.get('caijing_status', 'source_unavailable'),
+                data.get('eeo', {}).get('count', 0),
+                json.dumps(data.get('eeo', {}).get('items', []), ensure_ascii=False),
+                data.get('eeo_status', 'source_unavailable'),
+                data.get('sina_live', {}).get('count', 0),
+                json.dumps(data.get('sina_live', {}).get('items', []), ensure_ascii=False),
+                data.get('sina_live_status', 'source_unavailable'),
+                data.get('ths_hk', {}).get('count', 0),
+                json.dumps(data.get('ths_hk', {}).get('items', []), ensure_ascii=False),
+                data.get('ths_hk_status', 'source_unavailable'),
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"插入聚合新闻失败: {e}")
+            return False
+
+    def insert_mmx_search(self, data: Dict[str, Any]) -> bool:
+        """插入 mmx 搜索结果（mmx_search 采集器）"""
+        try:
+            self.conn.execute("""
+                INSERT OR IGNORE INTO mmx_search_data (
+                    query, title, link, snippet, date,
+                    collected_at, ingested_at
+                ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (
+                data['query'],
+                data.get('title', ''),
+                data.get('link', ''),
+                data.get('snippet', ''),
+                data.get('date', ''),
+                data.get('collected_at', '') or datetime.now(TZ).isoformat(),
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"insert_mmx_search失败: {e}")
+            return False
+
+    def get_latest_news_aggregator(self) -> Optional[Dict[str, Any]]:
+        """获取最新聚合新闻"""
+        cur = self.conn.execute("""
+            SELECT id, source, collected_at,
+                   hackernews_count, hackernews_items,
+                   github_count, github_items,
+                   ths_count, ths_items,
+                   caijing_count, caijing_items, caijing_status,
+                   eeo_count, eeo_items, eeo_status,
+                   sina_live_count, sina_live_items, sina_live_status,
+                   ths_hk_count, ths_hk_items, ths_hk_status,
+                   ingested_at
+            FROM news_aggregator_data
+            ORDER BY ingested_at DESC
+            LIMIT 1
+        """)
+        row = cur.fetchone()
+        if row:
+            d = dict(row)
+            # 反序列化 JSON 字段
+            for field in ['hackernews_items', 'github_items', 'ths_items',
+                         'caijing_items', 'eeo_items', 'sina_live_items', 'ths_hk_items']:
+                if d.get(field) and isinstance(d[field], str):
+                    try:
+                        d[field] = json.loads(d[field])
+                    except Exception:
+                        pass
+            return d
+        return None
+
+    def get_latest_daily(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """获取最新日线数据"""
+        cur = self.conn.execute("""
+            SELECT id, source, symbol, CAST(trade_date AS TEXT) as trade_date,
+                   open, high, low, close, pre_close, change, pct_chg,
+                   vol, amount, raw_data, ingested_at, updated_at
+            FROM daily_data
+            WHERE symbol = ?
+            ORDER BY trade_date DESC, ingested_at DESC
+            LIMIT 1
+        """, (symbol,))
+        row = cur.fetchone()
+        if row:
+            return dict(row)
+        return None
+
+    def get_daily(self, symbol: str, days: int = 30) -> List[Dict[str, Any]]:
+        """获取最近 N 日日线数据"""
+        cur = self.conn.execute("""
+            SELECT id, source, symbol, CAST(trade_date AS TEXT) as trade_date,
+                   open, high, low, close, pre_close, change, pct_chg,
+                   vol, amount, raw_data, ingested_at, updated_at
+            FROM daily_data
+            WHERE symbol = ?
+            ORDER BY trade_date DESC
+            LIMIT ?
+        """, (symbol, days))
+        return [dict(row) for row in cur.fetchall()]
+
+    # ========== 沪深港通（北向资金） ==========
+    def get_latest_hsgt(self, trade_date: Optional[str] = None) -> List[Dict[str, Any]]:
+        """获取北向资金 Top10"""
+        if trade_date:
+            cur = self.conn.execute("""
+                SELECT id, source, CAST(trade_date AS TEXT) as trade_date,
+                       ts_code, name, close, change, pct_chg, vol, amount,
+                       raw_data, ingested_at, updated_at
+                FROM hsgt_data
+                WHERE trade_date = CAST(? AS TEXT)
+                ORDER BY amount DESC
+                LIMIT 20
+            """, (trade_date,))
+        else:
+            cur = self.conn.execute("""
+                SELECT id, source, CAST(trade_date AS TEXT) as trade_date,
+                       ts_code, name, close, change, pct_chg, vol, amount,
+                       raw_data, ingested_at, updated_at
+                FROM hsgt_data
+                ORDER BY trade_date DESC, amount DESC
+                LIMIT 20
+            """)
+        return [dict(row) for row in cur.fetchall()]
+
+    def get_stock_basic(self, symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """查询股票基本信息"""
+        if symbol:
+            cur = self.conn.execute("""
+                SELECT id, source, symbol, ts_code, name, area, industry, market,
+                       CAST(list_date AS TEXT) as list_date,
+                       raw_data, ingested_at, updated_at
+                FROM stock_basic_data
+                WHERE symbol = ? OR ts_code = ?
+                ORDER BY ingested_at DESC
+                LIMIT 1
+            """, (symbol, symbol))
+            row = cur.fetchone()
+            return dict(row) if row else None
+        return None
+
+    # ========== 盘中估算净值 ==========
+    def insert_estimate_nav(self, data: Dict[str, Any]) -> bool:
+        """插入盘中估算净值"""
+        try:
+            self.conn.execute("""
+                INSERT OR REPLACE INTO estimate_nav_data (
+                    source, symbol, fund_name, nav_date, dwjz,
+                    estimate_nav, estimate_growth, estimate_time,
+                    raw_data, ingested_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (
+                data.get('source', 'fundgz'),
+                data['symbol'],
+                data.get('fund_name'),
+                data.get('nav_date'),
+                data.get('dwjz'),
+                data['estimate_nav'],
+                data.get('estimate_growth'),
+                data.get('estimate_time'),
+                json.dumps(data.get('raw', {}), ensure_ascii=False) if data.get('raw') else None
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"插入估算净值失败: {e}")
+            return False
+
+    def get_latest_estimate_nav(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """获取最新盘中估算净值"""
+        cur = self.conn.execute("""
+            SELECT * FROM estimate_nav_data
+            WHERE symbol = ?
+            ORDER BY estimate_time DESC
+            LIMIT 1
+        """, (symbol,))
+        row = cur.fetchone()
+        if row:
+            return dict(row)
+        return None
+
+    def get_nav_history(self, symbol: str, days: int = 30) -> List[Dict[str, Any]]:
+        """获取历史净值"""
+        start_date = (datetime.now(TZ) - timedelta(days=days)).date()
+        cur = self.conn.execute("""
+            SELECT nav_date, nav, acc_nav, change_pct
+            FROM nav_data
+            WHERE symbol = ? AND nav_date >= ?
+            ORDER BY nav_date ASC
+        """, (symbol, start_date))
+        return [dict(row) for row in cur.fetchall()]
+
+    # ==================== ESTIMATE NAV DATA ====================
+
+    def insert_estimate_nav(self, data: Dict[str, Any]) -> bool:
+        """插入盘中估算净值，支持UPSERT"""
+        try:
+            self.conn.execute("""
+                INSERT OR REPLACE INTO estimate_nav_data (
+                    source, symbol, fund_name, nav_date, dwjz,
+                    estimate_nav, estimate_growth, estimate_time,
+                    raw_data, ingested_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """, (
+                data.get('source', 'fundgz'),
+                data['symbol'],
+                data.get('fund_name'),
+                data.get('nav_date'),
+                data.get('dwjz'),
+                data['estimate_nav'],
+                data.get('estimate_growth'),
+                data.get('estimate_time'),
+                json.dumps(data.get('raw', {}), ensure_ascii=False) if data.get('raw') else None
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"插入/更新估算净值失败: {e}")
+            return False
+
+    def get_latest_estimate_nav(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """获取最新估算净值"""
+        cur = self.conn.execute("""
+            SELECT * FROM estimate_nav_data
+            WHERE symbol = ?
+            ORDER BY estimate_time DESC
+            LIMIT 1
+        """, (symbol,))
+        row = cur.fetchone()
+        if row:
+            return dict(row)
+        return None
+
+    # ==================== PRICE DATA ====================
+
+    def insert_price(self, data: Dict[str, Any]) -> bool:
+        """插入实时行情"""
+        try:
+            self.conn.execute("""
+                INSERT INTO price_data (
+                    source, symbol, trade_time, price, volume, amount,
+                    high, low, open, prev_close, raw_data,
+                    ingested_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """, (
+                data['source'],
+                data['symbol'],
+                data['trade_time'],
+                data['price'],
+                data.get('volume'),
+                data.get('amount'),
+                data.get('high'),
+                data.get('low'),
+                data.get('open'),
+                data.get('prev_close'),
+                json.dumps(data.get('raw', {}), ensure_ascii=False) if data.get('raw') else None
+            ))
+            self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            # 重复数据，忽略
+            return False
+        except Exception as e:
+            logger.error(f"插入行情失败: {e}")
+            return False
+
+    def get_price_history(self, symbol: str, days: int = 30) -> List[Dict[str, Any]]:
+        """获取历史行情"""
+        start_time = datetime.now(TZ) - timedelta(days=days)
+        # trade_time 混用 ISO("2026-10-28T...") 和 compact("20261027 15:00:00") 格式，
+        # 直接字符串排序会因 "-"(0x2D) < 数字而把 compact 行永远排在前面。
+        # 用 CASE 把 compact 归一化为 ISO 格式再排序。
+        cur = self.conn.execute("""
+            SELECT trade_time, price, volume, amount, high, low, open, prev_close
+            FROM price_data
+            WHERE symbol = ? AND trade_time >= ?
+            ORDER BY CASE
+                WHEN trade_time LIKE '____-__-__%'
+                    THEN replace(substr(trade_time,1,19),'T',' ')
+                ELSE substr(trade_time,1,4)||'-'||substr(trade_time,5,2)||'-'||substr(trade_time,7,2)||' '||substr(trade_time,10,8)
+            END ASC
+        """, (symbol, start_time))
+        return [dict(row) for row in cur.fetchall()]
+    def get_daily_history(self, symbol: str, days: int = 60) -> List[Dict[str, Any]]:
+        """日 K 历史（daily_data：东财日线回填/增量，见 scripts/backfill_daily_kline.py）。
+
+        ⚠️ A3 时区口径：trade_date 是 DATE 型（本地交易日历），cutoff 按本地日历天
+           计算，与 started_at 等本地列同一口径；daily_data **不在清理策略里**
+           （指标需要 ≥60 根，做 90 天清理会把它截短）。
+           升序返回，与 bars_from_intraday 的输出方向一致。
+        """
+        cutoff = (datetime.now(TZ) - timedelta(days=days)).strftime("%Y-%m-%d")
+        cur = self.conn.execute(
+            "SELECT trade_date, open, high, low, close, vol, amount"
+            " FROM daily_data WHERE symbol = ? AND trade_date >= ?"
+            " ORDER BY trade_date ASC", (symbol, cutoff))
+        return [dict(row) for row in cur.fetchall()]
+
+
+    def get_latest_price(self, symbol: str, source: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """获取最新行情，直接返回最新数据
+
+        source 不为空时按来源过滤（原先忽略 source，导致点名 eastmoney
+        却返回别的来源的行情，排查时容易被误导）。
+        """
+        # trade_time 混用 ISO/compact 两种格式，必须归一化后排序，否则 compact 行永远胜出
+        sql = """
+            SELECT * FROM price_data
+            WHERE symbol = ?
+        """
+        params: List[Any] = [symbol]
+        if source and source != "*":
+            sql += " AND source = ?"
+            params.append(source)
+        sql += """
+            ORDER BY CASE
+                WHEN trade_time LIKE '____-__-__%'
+                    THEN replace(substr(trade_time,1,19),'T',' ')
+                ELSE substr(trade_time,1,4)||'-'||substr(trade_time,5,2)||'-'||substr(trade_time,7,2)||' '||substr(trade_time,10,8)
+            END DESC
+            LIMIT 1
+        """
+        cur = self.conn.execute(sql, tuple(params))
+        row = cur.fetchone()
+        if not row:
+            return None
+
+        return dict(row)
+
+    # ==================== MINUTE DATA ====================
+
+    def insert_minute_bars(self, bars: List[Dict[str, Any]]) -> int:
+        """批量插入分钟K线，返回插入数量"""
+        count = 0
+        now = datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')
+        for bar in bars:
+            try:
+                self.conn.execute("""
+                    INSERT OR IGNORE INTO minute_data (
+                        symbol, name, trade_date, trade_time,
+                        open, high, low, close, volume, amount, source, ingested_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    bar['symbol'],
+                    bar.get('name'),
+                    bar['trade_date'],
+                    bar['trade_time'],
+                    bar.get('open'),
+                    bar.get('high'),
+                    bar.get('low'),
+                    bar['close'],
+                    bar.get('volume', 0),
+                    bar.get('amount'),
+                    bar.get('source', 'sina'),
+                    now
+                ))
+                count += 1
+            except Exception as e:
+                logger.debug(f"分钟数据插入跳过: {bar.get('trade_time')}, {e}")
+        self.conn.commit()
+        return count
+
+    def get_latest_minute_bar(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """获取某标的最新的分钟K线"""
+        cur = self.conn.execute("""
+            SELECT * FROM minute_data
+            WHERE symbol = ?
+            ORDER BY trade_time DESC
+            LIMIT 1
+        """, (symbol,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_minute_bars(self, symbol: str, date: str = None) -> List[Dict[str, Any]]:
+        """获取指定标的的分钟K线，date为空则取今日"""
+        if date is None:
+            date = datetime.now(TZ).strftime('%Y-%m-%d')
+        cur = self.conn.execute("""
+            SELECT * FROM minute_data
+            WHERE symbol = ? AND trade_date = ?
+            ORDER BY trade_time ASC
+        """, (symbol, date))
+        return [dict(row) for row in cur.fetchall()]
+
+    # ==================== NEWS DATA ====================
+
+    def get_news_by_link(self, link: str) -> Optional[Dict[str, Any]]:
+        """根据链接查询新闻是否已存在"""
+        cur = self.conn.execute("""
+            SELECT id FROM news_data WHERE link = ?
+        """, (link,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def insert_news(self, data: Dict[str, Any]) -> bool:
+        """插入新闻，link必须唯一"""
+        try:
+            self.conn.execute("""
+                INSERT INTO news_data (
+                    source, title, summary, link, symbol, published,
+                    ingested_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """, (
+                data['source'],
+                data['title'],
+                data.get('summary'),
+                data['link'],
+                data.get('symbol'),
+                data.get('published')
+            ))
+            self.conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            # link已存在，去重
+            return False
+
+    def get_recent_news(self, source: Optional[str] = None, hours: int = 24) -> List[Dict[str, Any]]:
+        """获取最近新闻（用于调试）"""
+        start_time = datetime.now(TZ) - timedelta(hours=hours)
+        cur = self.conn.execute("""
+            SELECT * FROM news_data
+            WHERE ingested_at >= ?
+            ORDER BY ingested_at DESC
+            LIMIT 50
+        """, (start_time,))
+        return [dict(row) for row in cur.fetchall()]
+
+    def insert_index(self, data: Dict[str, Any]) -> bool:
+        """插入指数数据（支持批量）"""
+        try:
+            # 兼容单条和批量
+            if isinstance(data, list):
+                for item in data:
+                    self._insert_index_one(item)
+            else:
+                self._insert_index_one(data)
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"insert_index失败: {e}")
+            return False
+
+    def _insert_index_one(self, data: Dict[str, Any]):
+        """插入单条指数数据"""
+        # 优先用 trade_date，否则从 timestamp 提取
+        trade_date = data.get('trade_date')
+        if not trade_date and data.get('timestamp'):
+            trade_date = data['timestamp'][:10]
+        if not trade_date:
+            trade_date = datetime.now().strftime('%Y-%m-%d')
+        self.conn.execute("""
+            INSERT OR REPLACE INTO index_data
+            (code, name, price, change_pct, change_amount, volume, amount,
+             high, low, open, prev_close, source, trade_date, trade_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            data['code'],
+            data['name'],
+            data.get('price'),
+            data.get('change_pct'),
+            data.get('change_amount'),
+            data.get('volume'),
+            data.get('amount'),
+            data.get('high'),
+            data.get('low'),
+            data.get('open'),
+            data.get('prev_close'),
+            data.get('source', 'akshare'),
+            trade_date,
+            data.get('timestamp')
+        ))
+
+    def get_latest_index(self, code: Optional[str] = None) -> List[Dict[str, Any]]:
+        """获取最新指数数据"""
+        if code:
+            cur = self.conn.execute("""
+                SELECT * FROM index_data WHERE code = ?
+                ORDER BY trade_date DESC LIMIT 1
+            """, (code,))
+        else:
+            cur = self.conn.execute("""
+                SELECT * FROM index_data
+                WHERE code IN ('sh000001', 'sh000300', 'sh000688', 'sz399001', 'sz399006')
+                AND trade_date = (SELECT MAX(trade_date) FROM index_data)
+                ORDER BY code
+            """)
+        return [dict(row) for row in cur.fetchall()]
+
+    # ==================== ANNOUNCEMENT DATA ====================
+
+    def insert_announcement(self, data: Dict[str, Any]) -> bool:
+        """插入公告数据"""
+        try:
+            self.conn.execute("""
+                INSERT OR IGNORE INTO announcement_data (
+                    source, symbol, title, announcement_time, link, raw_data,
+                    ingested_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """, (
+                data.get('source', 'cninfo'),
+                data['symbol'],
+                data['title'],
+                data.get('announcement_time'),
+                data['link'],
+                json.dumps(data.get('raw', {}), ensure_ascii=False) if data.get('raw') else None
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"insert_announcement失败: {e}")
+            return False
+
+    def get_announcements(self, symbol: str, days: int = 30) -> List[Dict[str, Any]]:
+        """获取最近公告"""
+        start_date = (datetime.now(TZ) - timedelta(days=days)).date()
+        cur = self.conn.execute("""
+            SELECT * FROM announcement_data
+            WHERE symbol = ? AND announcement_time >= ?
+            ORDER BY announcement_time DESC
+            LIMIT 50
+        """, (symbol, start_date))
+        return [dict(row) for row in cur.fetchall()]
+
+    # ==================== COMMUNITY DATA ====================
+
+    def insert_community(self, data: Dict[str, Any]) -> bool:
+        """插入社区/股吧数据"""
+        try:
+            self.conn.execute("""
+                INSERT OR IGNORE INTO community_data (
+                    source, symbol, title, author, reply_count, click_count,
+                    published, link, raw_data,
+                    ingested_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """, (
+                data.get('source', 'eastmoney_guba'),
+                data['symbol'],
+                data['title'],
+                data.get('author'),
+                data.get('reply_count', 0),
+                data.get('click_count', 0),
+                data.get('published'),
+                data['link'],
+                json.dumps(data.get('raw', {}), ensure_ascii=False) if data.get('raw') else None
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"insert_community失败: {e}")
+            return False
+
+    def insert_fund_flow(self, data: Dict[str, Any]) -> bool:
+        """插入主力资金/板块资金流数据（INSERT OR REPLACE：同 rank_data 重采集时
+        UPDATE 值而不是静默跳过——原来 OR IGNORE 导致 496 条采集全部被静默吞掉，
+        collection_log 谎报 items_stored=496，表里一行都没有）"""
+        try:
+            # 解析 "12.34亿" 格式的字符串为浮点 (单位元)
+            def parse_amount(s):
+                if s is None: return None
+                if isinstance(s, (int, float)): return float(s)
+                s = str(s).strip()
+                if not s: return None
+                try:
+                    if '亿' in s: return float(s.replace('亿','')) * 1e8
+                    if '万' in s: return float(s.replace('万','')) * 1e4
+                    return float(s)
+                except: return None
+
+            self.conn.execute("""
+                INSERT OR REPLACE INTO fund_flow_data (
+                    source, flow_type, sector_kind, rank_no,
+                    symbol, name, price, change_pct,
+                    main_net_inflow, main_net_pct,
+                    super_large_net, large_net, medium_net, small_net,
+                    leading_stock, leading_change_pct,
+                    rank_data, raw_data
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                data.get('source', 'eastmoney_em'),
+                data['flow_type'],
+                data.get('sector_kind'),
+                data.get('rank_no'),
+                data.get('symbol'),
+                data['name'],
+                data.get('price'),
+                data.get('change_pct'),
+                parse_amount(data.get('main_net_inflow')),
+                data.get('main_net_pct'),
+                parse_amount(data.get('super_large_net')),
+                parse_amount(data.get('large_net')),
+                parse_amount(data.get('medium_net')),
+                parse_amount(data.get('small_net')),
+                data.get('leading_stock'),
+                data.get('leading_change_pct'),
+                data['rank_date'],
+                json.dumps(data.get('raw', {}), ensure_ascii=False) if data.get('raw') else None
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"insert_fund_flow失败: {e}")
+            return False
+
+    def get_fund_flow(self, flow_type: str, days: int = 7, limit: int = 50, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+        """获取最近的主力资金/板块资金流数据
+
+        symbol: 可选; 提供时按 sym 过滤 (单股资金流)
+        """
+        start_date = (datetime.now(TZ) - timedelta(days=days)).date().isoformat()
+        if symbol:
+            cur = self.conn.execute("""
+                SELECT * FROM fund_flow_data
+                WHERE flow_type = ? AND symbol = ? AND rank_data >= ?
+                ORDER BY rank_data DESC, rank_no ASC
+                LIMIT ?
+            """, (flow_type, symbol, start_date, limit))
+        else:
+            cur = self.conn.execute("""
+                SELECT * FROM fund_flow_data
+                WHERE flow_type = ? AND rank_data >= ?
+                ORDER BY rank_data DESC, rank_no ASC
+                LIMIT ?
+            """, (flow_type, start_date, limit))
+        return [dict(row) for row in cur.fetchall()]
+
+    def get_community_posts(self, symbol: str, days: int = 30) -> List[Dict[str, Any]]:
+        """获取最近社区帖子"""
+        start_date = (datetime.now(TZ) - timedelta(days=days)).date()
+        cur = self.conn.execute("""
+            SELECT * FROM community_data
+            WHERE symbol = ? AND published >= ?
+            ORDER BY published DESC
+            LIMIT 50
+        """, (symbol, start_date))
+        return [dict(row) for row in cur.fetchall()]
+
+    # ==================== SUBSCRIPTIONS ====================
+
+    def get_due_subscriptions(self, now: datetime) -> List[Dict[str, Any]]:
+        """获取需要采集的订阅（last_collected + frequency_min <= now）
+        注意： caller 需要自行检查 trading_hours_only 限制
+        """
+        cur = self.conn.execute("""
+            SELECT * FROM subscriptions
+            WHERE enabled = TRUE
+              AND (last_collected IS NULL OR
+                   datetime(last_collected, '+' || frequency_min || ' minutes') <= ?)
+        """, (now,))
+        return [dict(row) for row in cur.fetchall()]
+
+    def get_subscriptions_by_type(self, type_: str) -> List[Dict[str, Any]]:
+        """按类型获取所有订阅"""
+        cur = self.conn.execute("""
+            SELECT * FROM subscriptions WHERE type = ? AND enabled = TRUE
+        """, (type_,))
+        return [dict(row) for row in cur.fetchall()]
+
+    def get_subscription_by_symbol(self, symbol: str, data_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """根据symbol和data_type查找订阅（用于API逻辑判断）"""
+        query = "SELECT * FROM subscriptions WHERE symbol = ? AND enabled = 1"
+        params = [symbol]
+        if data_type:
+            # 注意：data_types是JSON数组字符串，简单LIKE匹配（生产环境建议用SQLite JSON函数）
+            query += " AND data_types LIKE ?"
+            params.append(f'%"{data_type}"%')
+        cur = self.conn.execute(query, params)
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
+    def save_fundamental(self, data: Dict[str, Any]) -> bool:
+        """保存基本面数据（支持股票和基金）"""
+        try:
+            # 对于基金数据，使用 today 作为 date
+            date = data.get('date') or datetime.now().strftime('%Y-%m-%d')
+            
+            self.conn.execute("""
+                INSERT OR REPLACE INTO stock_fundamentals
+                (symbol, date, price, pe_ttm, pb, total_mv, circ_mv, industry, raw_data, ingested_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now','localtime'))
+            """, (
+                data['symbol'],
+                date,
+                data.get('price'),
+                data.get('pe_ttm'),
+                data.get('pb'),
+                data.get('total_mv'),
+                data.get('circ_mv'),
+                data.get('industry'),
+                # 基金数据存储完整信息，股票数据存原始片段
+                json.dumps(data) if (data.get('data_type') == 'fundamental' and 'manager' in data) else (data.get('raw') or str(data.get('raw_parts', [])[:1000]))
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"save_fundamental失败: {e}")
+            return False
+
+    def get_latest_fundamental(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """获取最新基本面"""
+        cur = self.conn.execute("""
+            SELECT * FROM stock_fundamentals
+            WHERE symbol = ?
+            ORDER BY date DESC
+            LIMIT 1
+        """, (symbol,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        # 转换日期为字符串
+        if isinstance(data.get('date'), (datetime, date)):
+            data['date'] = data['date'].strftime('%Y-%m-%d')
+        if isinstance(data.get('ingested_at'), (datetime, date)):
+            data['ingested_at'] = data['ingested_at'].isoformat()
+        return data
+
+    def get_fundamental_history(self, symbol: str, days: int = 30) -> List[Dict[str, Any]]:
+        """获取基本面历史（按日期倒序）"""
+        cur = self.conn.execute("""
+            SELECT * FROM stock_fundamentals
+            WHERE symbol = ? AND date >= date('now', '-' || ? || ' days')
+            ORDER BY date DESC
+        """, (symbol, days))
+        return [dict(row) for row in cur.fetchall()]
+
+
+    def update_subscription_last_run(self, sub_id: int, run_time: datetime):
+        """更新订阅上次运行时间
+
+        SQLite 的 datetime() 函数不认 ISO 8601 (T 分隔) 和 timezone (+08:00),
+        会静默解析成错误时间 (倒退 7 小时), 导致 get_due_subscriptions 永远 due,
+        订阅被每 60s tick 触发 (实际应该按 frequency_min 等距).
+        修复: 写入前转成 SQLite 期望的 "YYYY-MM-DD HH:MM:SS" 格式.
+        """
+        # 兼容 datetime 对象 / 字符串
+        if isinstance(run_time, str):
+            run_time = datetime.fromisoformat(run_time)
+        sqlite_fmt = run_time.strftime('%Y-%m-%d %H:%M:%S')
+        self.conn.execute("""
+            UPDATE subscriptions SET last_collected = ? WHERE id = ?
+        """, (sqlite_fmt, sub_id))
+        self.conn.commit()
+
+    def add_subscription(self, name: str, type_: str, config: Dict[str, Any],
+                        data_types: List[str], frequency_min: int = 60, symbol: Optional[str] = None,
+                        trading_hours_only: bool = False, backup_sources: Optional[str] = None) -> int:
+        """新增订阅，返回ID"""
+        cur = self.conn.execute("""
+            INSERT INTO subscriptions (
+                name, type, config, symbol, data_types, frequency_min,
+                trading_hours_only, backup_sources, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (
+            name,
+            type_,
+            json.dumps(config, ensure_ascii=False),
+            symbol,
+            json.dumps(data_types, ensure_ascii=False),
+            frequency_min,
+            1 if trading_hours_only else 0,
+            backup_sources
+        ))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def update_subscription(self, sub_id: int, **kwargs):
+        """更新订阅字段"""
+        allowed = ['name', 'symbol', 'data_types', 'frequency_min', 'trading_hours_only',
+                   'backup_sources', 'enabled', 'config']
+        set_parts = []
+        values = []
+        for key, val in kwargs.items():
+            if key not in allowed:
+                continue
+            if key in ['data_types', 'config'] and isinstance(val, (dict, list)):
+                val = json.dumps(val, ensure_ascii=False)
+            elif key == 'trading_hours_only':
+                val = 1 if val else 0
+            set_parts.append(f"{key} = ?")
+            values.append(val)
+        if not set_parts:
+            return False
+        values.append(sub_id)
+        sql = f"UPDATE subscriptions SET {', '.join(set_parts)}, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+        self.conn.execute(sql, values)
+        self.conn.commit()
+        return True
+
+    def delete_subscription(self, sub_id: int) -> bool:
+        """删除订阅"""
+        n = safe_delete(self.conn, "DELETE FROM subscriptions WHERE id = ?", (sub_id,),
+                        max_rows=1, reason=f"删除订阅 id={sub_id}")
+        return n > 0
+
+    def get_all_subscriptions(self) -> List[Dict[str, Any]]:
+        """获取所有订阅（显式列以保证新增字段可见）"""
+        cur = self.conn.execute("""
+            SELECT id, name, type, config, symbol, data_types, frequency_min,
+                   last_collected, enabled, trading_hours_only, backup_sources,
+                   created_at, updated_at
+            FROM subscriptions
+            ORDER BY enabled DESC, id ASC
+        """)
+        return [dict(row) for row in cur.fetchall()]
+
+    # ==================== COLLECTION LOG ====================
+
+    def create_ticket(self, title: str, priority: str, description: str) -> int:
+        """创建工单，返回ID"""
+        cur = self.conn.execute("""
+            INSERT INTO tickets (title, priority, description, status, created_at, updated_at)
+            VALUES (?, ?, ?, 'open', datetime('now','localtime'), datetime('now','localtime'))
+        """, (title, priority, description))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_tickets(self, status: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """查询工单列表"""
+        query = "SELECT * FROM tickets"
+        params = []
+        if status:
+            query += " WHERE status = ?"
+            params.append(status)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        cur = self.conn.execute(query, params)
+        rows = cur.fetchall()
+        return [dict(row) for row in rows]
+
+    def get_ticket(self, ticket_id: int) -> Optional[Dict[str, Any]]:
+        """查询单个工单"""
+        cur = self.conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def update_ticket_status(self, ticket_id: int, status: str) -> bool:
+        """更新工单状态"""
+        n = self._dml("""
+            UPDATE tickets SET status = ?, updated_at = datetime('now','localtime')
+            WHERE id = ?
+        """, (status, ticket_id))
+        self.conn.commit()
+        return n > 0
+
+    def add_ticket_comment(self, ticket_id: int, author: str, content: str) -> bool:
+        """添加工单评论（JSON存储）"""
+        import json
+        # 读取现有评论
+        cur = self.conn.execute("SELECT comments_json FROM tickets WHERE id = ?", (ticket_id,))
+        row = cur.fetchone()
+        if not row:
+            return False
+        comments = json.loads(row[0] or '[]')
+        comments.append({
+            "author": author,
+            "content": content,
+            "at": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        })
+        # 更新
+        self.conn.execute("""
+            UPDATE tickets SET comments_json = ?, updated_at = datetime('now','localtime')
+            WHERE id = ?
+        """, (json.dumps(comments, ensure_ascii=False), ticket_id))
+        self.conn.commit()
+        return True
+
+
+    def log_collection(self, subscription_id: Optional[int], source: str, symbol: Optional[str],
+                      data_type: str, status: str, items_fetched: int = 0,
+                      items_stored: int = 0, error_message: Optional[str] = None,
+                      started_at: datetime = None, finished_at: datetime = None):
+        """记录采集日志"""
+        duration = None
+        if started_at and finished_at:
+            duration = (finished_at - started_at).total_seconds()
+
+        self.conn.execute("""
+            INSERT INTO collection_log (
+                subscription_id, source, symbol, data_type, status,
+                items_fetched, items_stored, error_message,
+                started_at, finished_at, duration_sec
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            subscription_id,
+            source,
+            symbol,
+            data_type,
+            status,
+            items_fetched,
+            items_stored,
+            error_message,
+            started_at or datetime.now(TZ),
+            finished_at,
+            duration
+        ))
+        self.conn.commit()
+
+    def get_recent_errors(self, hours: int = 1) -> List[Dict[str, Any]]:
+        """获取最近N小时的错误日志
+
+        ⚠️ A3 时区口径：collection_log.started_at 由本函数同文件的 insert 写入，
+           用 datetime.now(TZ)（本地 Asia/Shanghai）；这里 cutoff 也用本地，
+           **本地对本地，一致**。不要"顺手"改成 UTC——那是另一种口径混用。
+        """
+        start = datetime.now(TZ) - timedelta(hours=hours)
+        cur = self.conn.execute("""
+            SELECT * FROM collection_log
+            WHERE status = 'failed' AND started_at >= ?
+            ORDER BY started_at DESC
+            LIMIT 20
+        """, (start,))
+        return [dict(row) for row in cur.fetchall()]
+
+    def get_stats(self) -> Dict[str, Any]:
+        """获取统计信息"""
+        cur = self.conn.execute("SELECT COUNT(*) as cnt FROM nav_data")
+        nav_count = cur.fetchone()['cnt']
+
+        cur = self.conn.execute("SELECT COUNT(*) as cnt FROM price_data")
+        price_count = cur.fetchone()['cnt']
+
+        cur = self.conn.execute("SELECT COUNT(*) as cnt FROM news_data")
+        news_count = cur.fetchone()['cnt']
+
+        cur = self.conn.execute("SELECT COUNT(*) as cnt FROM subscriptions WHERE enabled = TRUE")
+        active_subs = cur.fetchone()['cnt']
+
+        # 最近24小时成功率
+        # ⚠️ A3：collection_log.started_at 存**本地**时间，而 SQLite datetime('now')
+        #    是 **UTC** —— 直接用会把"24 小时"错算成 32 小时（UTC 比本地早 8h，
+        #    早 8h 的时间戳更小 → 更多行 ≥ 它）。必须加 'localtime' 对齐写入口径。
+        cur = self.conn.execute("""
+            SELECT status, COUNT(*) as cnt FROM collection_log
+            WHERE started_at >= datetime('now', 'localtime', '-1 day')
+            GROUP BY status
+        """)
+        status_counts = {row['status']: row['cnt'] for row in cur.fetchall()}
+
+        total = sum(status_counts.values())
+        success_rate = (status_counts.get('success', 0) / total * 100) if total > 0 else 0
+
+        # 数据库文件大小
+        db_size_mb = self.db_path.stat().st_size / (1024 * 1024) if self.db_path.exists() else 0
+
+        return {
+            'records': {
+                'nav': nav_count,
+                'price': price_count,
+                'news': news_count
+            },
+            'active_subscriptions': active_subs,
+            'collection_24h': status_counts,
+            'success_rate_24h': round(success_rate, 2),
+            'database_size_mb': round(db_size_mb, 2),
+            'generated_at': datetime.now(TZ).isoformat()
+        }
+
+    # ==================== CLEANUP ====================
+
+    # 清理策略定义：(表名, 时间列, retention_days 配置键, 默认保留天数, 说明)
+    # ⚠️ 2026-10-26 重写。原实现有三个问题，全部已修：
+    #   ① **必然抛异常**：`DELETE FROM news_data WHERE timestamp < ?` —— news_data 表
+    #      **没有 timestamp 列**（实际是 ingested_at/published/updated_at），
+    #      这条 DELETE 直接 `no such column: timestamp` → 函数在第一条就崩，
+    #      **后面的 price_data / collection_log 清理根本执行不到**。
+    #      这就是它「有定义、零调用方」的深层原因：就算调用了也必然失败。
+    #   ② **collection_log 保留期硬编码 30 天**，不读配置 → 无法调整。
+    #   ③ **不覆盖几个最大的表**（news_aggregator_data 756MB / mmx_search_data 265MB），
+    #      而 collection_log 连索引合计 435MB —— 库体积大头完全没被管。
+    # ⚠️⚠️ A3（2026-11-03 批评家）：最后一列是**时间列的时区口径标注**，必须显式。
+    #    同一个 cutoff 函数没法同时服务两种口径的列——本项目同一张库里两种口径都有：
+    #      utc   = SQLite DEFAULT CURRENT_TIMESTAMP / 应用写 datetime.now(timezone.utc)
+    #              （恒 UTC，与本地差 8 小时）
+    #      local = 应用写本地时间 datetime.now(TZ)（行情时间、调度时间、DATE 交易日历）
+    #    口径是 2026-11-03 逐列实测 MAX(col) 与当时 UTC/本地时间对照定下的：
+    #      started_at 11:38=本地 ✓ │ trade_time 15:00=本地收盘 ✓ │ ingested_at 03:14=UTC ✓
+    #      trade_date=DATE 按本地交易日历 │ estimate_nav/aggregator/mmx/fund_flow=UTC ✓
+    CLEANUP_POLICIES = [
+        ("collection_log",      "started_at",  "log_days",           30, "采集日志（表+索引合计 435MB）", "local"),
+        # price_data 默认 60 → 90 天：dsa-mcp 的 analyze_trend(days=60) 要 60 天窗口，
+        # 保留期正好卡在 60 天会在边界删掉刚采到的数据 → 留 30 天余量
+        ("price_data",          "trade_time",  "price_days",         90, "实时行情快照（dsa-mcp 需 60 天窗口，留 30 天余量）", "local"),
+        ("news_data",           "ingested_at", "news_days",          30, "个股新闻（link UNIQUE，删后可重采）", "utc"),
+        # minute_data.trade_date 是 DATE 型（纯日期）：与带时间的 cutoff 比较按
+        # 字符串字典序，边界日整天一起删——按本地交易日历口径，符合预期。
+        ("minute_data",         "trade_date",  "minute_days",        60, "分钟K线", "local"),
+        ("estimate_nav_data",   "ingested_at", "estimate_nav_days",  30, "盘中估算净值", "utc"),
+        ("news_aggregator_data","ingested_at", "aggregator_days",    14, "全网聚合新闻（单行可达 30KB）", "utc"),
+        ("mmx_search_data",     "collected_at","mmx_search_days",    90, "财经搜索结果（长期无消费）", "utc"),
+        # 2026-11-03（项 ⑥）：fund_flow_data 原来不在保留列表——top_n 扩容后
+        # 300 个股 + 992 板块 × ~6 批/日 ≈ 7750 行/天 ≈ 550MB/年，无限增长。
+        # 90 天与前值分析窗口匹配；更早的批次只对历史回测有用。
+        ("fund_flow_data",      "collected_at","fund_flow_days",     90, "资金流（个股+板块，top_n 扩容后 ~7750 行/日）", "utc"),
+    ]
+
+    def cleanup_old_data(self, retention_days: Dict[str, int], dry_run: bool = False) -> Dict[str, Any]:
+        """清理过期数据。
+
+        Args:
+            retention_days: {配置键: 保留天数}，缺省用 CLEANUP_POLICIES 里的默认天数
+            dry_run: True = **只统计不删除**（默认应先用这个看清单）
+
+        Returns:
+            {"deleted": {表名: 行数}, "cutoffs": {表名: 截止时间}, "dry_run": bool}
+        """
+        # A3：cutoff 按**列的口径**取——UTC 列用 UTC now，本地列用本地 now。
+        # 此前一刀切 UTC：对 local 列（collection_log.started_at / price_data.trade_time）
+        # 会少删 8 小时窗口（保守方向，无数据损失，但保留期悄悄变长 8h）。
+        now_utc = datetime.now(timezone.utc)
+        now_local = datetime.now(TZ)
+        deleted_counts = {}
+        cutoffs = {}
+
+        for table, time_col, cfg_key, default_days, desc, tz in self.CLEANUP_POLICIES:
+            days = int(retention_days.get(cfg_key, default_days))
+            now = now_utc if tz == "utc" else now_local
+            cutoff = now - timedelta(days=days)
+            cutoff_s = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+            cutoffs[table] = {"cutoff": cutoff_s, "retention_days": days,
+                              "desc": desc, "tz": tz}
+            try:
+                if dry_run:
+                    cur = self.conn.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE {time_col} < ?", (cutoff_s,))
+                    n = cur.fetchone()[0]
+                else:
+                    # ⚠️ 2026-10-29 加"影响行数上限"护栏：
+                    #    先数出**期望删除量**，再以它为上限删除；若实际删除数与期望
+                    #    不符（并发写入/判据漂移）→ **自动回滚**。
+                    #    （2026-10-29 订阅误删事故 = LIKE 通配符全表命中，无报错无告警
+                    #      —— 这类护栏是流程里缺的一环。）
+                    expected = self.conn.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE {time_col} < ?", (cutoff_s,)
+                    ).fetchone()[0]
+                    # NOTE: expect_rows (exact expectation), not max_rows:
+                    #   purging history can legitimately delete tens of thousands of rows;
+                    #   max_rows is bounded by the global fallback (HARD_MAX_ROWS=1000) and
+                    #   would misfire (it would roll back a legitimate purge). expect_rows
+                    #   means it must delete EXACTLY this many rows; any mismatch
+                    #   (concurrent write / predicate drift) -> rollback.
+                    n = safe_delete(
+                        self.conn,
+                        f"DELETE FROM {table} WHERE {time_col} < ?", (cutoff_s,),
+                        expect_rows=int(expected),
+                        reason=f"purge expired {table} (expect {expected} rows)",
+                    )
+                deleted_counts[table] = n
+            except Exception as e:
+                # ⚠️ 不再静默失败：单表失败要明确记录，其余表继续
+                logger.error(f"cleanup_old_data 清理 {table} 失败: {type(e).__name__}: {e}")
+                deleted_counts[table] = f"ERROR: {type(e).__name__}: {e}"
+
+        if dry_run:
+            logger.info(f"清理干跑（不删除）: {deleted_counts}")
+        else:
+            self.conn.commit()
+            logger.info(f"清理完成: {deleted_counts}")
+        return {"deleted": deleted_counts, "cutoffs": cutoffs, "dry_run": dry_run}
+
+    # ==================== FAILED TRANSFORMS（死信队列）====================
+
+    def get_unresolved_transforms(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """获取未解决的转换错误（死信队列）"""
+        try:
+            cur = self.conn.execute("""
+                SELECT id, data_type, symbol, source, raw_sample,
+                       transform_error, stack_trace, created_at
+                FROM failed_transforms
+                WHERE resolved_at IS NULL
+                ORDER BY created_at ASC
+                LIMIT ?
+            """, (limit,))
+            return [dict(row) for row in cur.fetchall()]
+        except Exception as e:
+            logger.error(f"get_unresolved_transforms 失败: {e}")
+            return []
+
+    def mark_transform_resolved(
+        self, letter_id: int, resolution: str = "manual", resolved_by: str = "scheduler"
+    ) -> bool:
+        """标记死信为已解决"""
+        try:
+            self.conn.execute("""
+                UPDATE failed_transforms
+                SET resolved_at = ?, resolution = ?, resolved_by = ?
+                WHERE id = ?
+            """, (now_tz().isoformat(), resolution, resolved_by, letter_id))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"mark_transform_resolved 失败: {e}")
+            return False
+
+    def insert_failed_transform(
+        self, data_type: str, symbol: Optional[str], source: str,
+        raw_sample: str, transform_error: str, stack_trace: str = ""
+    ) -> bool:
+        """插入死信（转换失败时由 chain 调用）"""
+        try:
+            self.conn.execute("""
+                INSERT INTO failed_transforms
+                (data_type, symbol, source, raw_sample, transform_error, stack_trace)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (data_type, symbol, source, raw_sample, transform_error, stack_trace))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"insert_failed_transform 失败: {e}")
+            return False
+
+    # ==================== FAILED COLLECTIONS（限频重试队列）====================
+
+    def insert_failed_collection(
+        self, subscription_id: int, source: str, symbol: Optional[str],
+        data_type: str, config: Optional[Dict[str, Any]] = None,
+        error_message: str = "", retry_after: Optional[datetime] = None
+    ) -> bool:
+        """插入限频记录（重试队列）"""
+        try:
+            self.conn.execute("""
+                INSERT INTO failed_collections
+                (subscription_id, source, symbol, data_type, config,
+                 error_message, retry_after)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                subscription_id, source, symbol, data_type,
+                json.dumps(config, ensure_ascii=False) if config else None,
+                error_message,
+                retry_after.isoformat() if retry_after else None,
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"insert_failed_collection 失败: {e}")
+            return False
+
+    def get_due_failed_collections(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+        """获取冷却到期的限频重试记录"""
+        if now is None:
+            now = now_tz()
+        try:
+            cur = self.conn.execute("""
+                SELECT id, subscription_id, source, symbol, data_type,
+                       config, error_message, retry_after, created_at
+                FROM failed_collections
+                WHERE retry_after IS NULL OR retry_after <= ?
+                ORDER BY created_at ASC
+            """, (now.isoformat(),))
+            return [dict(row) for row in cur.fetchall()]
+        except Exception as e:
+            logger.error(f"get_due_failed_collections 失败: {e}")
+            return []
+
+    def remove_failed_collection(self, fail_id: int) -> bool:
+        """删除限频重试记录（重试成功后调用）"""
+        try:
+            safe_delete(self.conn, "DELETE FROM failed_collections WHERE id = ?", (fail_id,),
+                        max_rows=1, reason=f"删除限频重试记录 id={fail_id}")
+            return True
+        except Exception as e:
+            logger.error(f"remove_failed_collection 失败: {e}")
+            return False
+
+    def update_failed_collection_retry_after(
+        self, fail_id: int, retry_after: datetime
+    ) -> bool:
+        """更新限频重试的冷却截止时间"""
+        try:
+            self.conn.execute("""
+                UPDATE failed_collections
+                SET retry_after = ?, updated_at = ?
+                WHERE id = ?
+            """, (retry_after.isoformat(), now_tz().isoformat(), fail_id))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"update_failed_collection_retry_after 失败: {e}")
+            return False
+
+    # ==================== SOURCE METRICS（信源质量动态排名）====================
+
+    def get_source_metrics(self, data_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """获取指定数据类型的信源质量（所有信源）"""
+        try:
+            if data_type:
+                cur = self.conn.execute("""
+                    SELECT source, data_type, total, success, failure,
+                           transform_error, avg_sec, success_rate,
+                           is_degraded, updated_at, consecutive_success
+                    FROM source_metrics
+                    WHERE data_type = ?
+                    ORDER BY success_rate DESC, total DESC
+                """, (data_type,))
+            else:
+                cur = self.conn.execute("""
+                    SELECT source, data_type, total, success, failure,
+                           transform_error, avg_sec, success_rate,
+                           is_degraded, updated_at, consecutive_success
+                    FROM source_metrics
+                    ORDER BY success_rate DESC, total DESC
+                """)
+            return [dict(row) for row in cur.fetchall()]
+        except Exception as e:
+            logger.error(f"get_source_metrics 失败: {e}")
+            return []
+
+    def get_source_metric(self, source: str, data_type: str) -> Optional[Dict[str, Any]]:
+        """获取单个 (source, data_type) 的信源质量"""
+        try:
+            cur = self.conn.execute("""
+                SELECT source, data_type, total, success, failure,
+                       transform_error, avg_sec, success_rate,
+                       is_degraded, updated_at, consecutive_success
+                FROM source_metrics
+                WHERE source = ? AND data_type = ?
+            """, (source, data_type))
+            row = cur.fetchone()
+            return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"get_source_metric 失败: {e}")
+            return None
+
+    def upsert_source_metric(
+        self, source: str, data_type: str,
+        success: bool, is_transform_error: bool = False, duration: float = 0.0
+    ) -> bool:
+        """
+        增量更新 source_metrics（成功/失败计数 + 移动平均耗时 + 成功率 + 连续成功）。
+        每次采集都调一次，用 UPSERT 保证原子。
+        """
+        try:
+            inc_total = 1
+            inc_success = 1 if success else 0
+            inc_failure = 0 if success else 1
+            inc_te = 1 if is_transform_error else 0
+
+            # 连续成功：成功时 +1，失败时清零
+            #
+            # ⚠️ 2026-10-26 修复：原写法把 SQL 表达式当**参数**传（consecutive_success = ?），
+            #    SQLite 收到的是字符串字面量 'COALESCE(consecutive_success, 0) + 1'，
+            #    存进列里变成 TEXT（typeof=text），不是数字 → 任何基于"连续成功次数"的
+            #    降级/告警逻辑都会失效。
+            #    现在改成 DO UPDATE 里的**原生 SQL 表达式**，用 excluded.success 判断本次成败。
+            #    （excluded.success = 本次插入的 inc_success，1=成功 0=失败）
+            self.conn.execute("""
+                INSERT INTO source_metrics
+                (source, data_type, total, success, failure, transform_error,
+                 avg_sec, success_rate, is_degraded, updated_at, consecutive_success)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                ON CONFLICT(source, data_type) DO UPDATE SET
+                    total = total + ?,
+                    success = success + ?,
+                    failure = failure + ?,
+                    transform_error = transform_error + ?,
+                    avg_sec = (avg_sec * total + ?) / (total + 1),
+                    success_rate = CAST(success + ? AS REAL) / (total + 1),
+                    updated_at = ?,
+                    consecutive_success = CASE
+                        WHEN excluded.success = 1
+                            THEN COALESCE(source_metrics.consecutive_success, 0) + 1
+                        ELSE 0
+                    END
+            """, (
+                source, data_type, inc_total, inc_success, inc_failure, inc_te,
+                duration,
+                1.0 if success else 0.0,   # 首次插入的 success_rate
+                now_tz().isoformat(),
+                1 if success else 0,
+                # ON CONFLICT 后的更新参数
+                inc_total, inc_success, inc_failure, inc_te,
+                duration,            # 移动平均的当前耗时
+                inc_success,         # 新增的成功数
+                now_tz().isoformat(),
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"upsert_source_metric 失败: {e}")
+            return False
+
+    def set_source_degraded(
+        self, source: str, data_type: str, is_degraded: bool
+    ) -> bool:
+        """设置/解除信源降级标志"""
+        try:
+            self.conn.execute("""
+                UPDATE source_metrics
+                SET is_degraded = ?, updated_at = ?
+                WHERE source = ? AND data_type = ?
+            """, (1 if is_degraded else 0, now_tz().isoformat(), source, data_type))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"set_source_degraded 失败: {e}")
+            return False
+
+    # ==================== MARKET STATS (Phase 2 新增) ====================
+
+    def save_market_stats(self, data: Dict[str, Any]) -> bool:
+        """保存市场涨跌统计 (sse+szse summary 合并)"""
+        try:
+            self.conn.execute("""
+                INSERT OR REPLACE INTO market_stats_data (
+                    trade_date,
+                    sse_listed_count, sse_stock_count, sse_total_mv, sse_circ_mv, sse_avg_pe,
+                    szse_stock_count, szse_total_mv, szse_circ_mv, szse_amount,
+                    total_listed_count, total_mv, raw_data
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                data.get('trade_date'),
+                data.get('sse_listed_count'), data.get('sse_stock_count'),
+                data.get('sse_total_mv'), data.get('sse_circ_mv'), data.get('sse_avg_pe'),
+                data.get('szse_stock_count'), data.get('szse_total_mv'),
+                data.get('szse_circ_mv'), data.get('szse_amount'),
+                data.get('total_listed_count'), data.get('total_mv'),
+                json.dumps(data.get('raw', {}), ensure_ascii=False) if data.get('raw') else None
+            ))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"save_market_stats 失败: {e}")
+            return False
+
+    def get_latest_market_stats(self) -> Optional[Dict[str, Any]]:
+        """获取最新一期市场涨跌统计"""
+        cur = self.conn.execute("""
+            SELECT * FROM market_stats_data ORDER BY trade_date DESC LIMIT 1
+        """)
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    # ==================== LIMIT UP POOL (Phase 2 新增) ====================
+
+    def save_limit_up_pool(self, data_list: List[Dict[str, Any]]) -> int:
+        """批量保存涨停池 (trade_date, items[])"""
+        if not data_list:
+            return 0
+        saved = 0
+        try:
+            for d in data_list:
+                self.conn.execute("""
+                    INSERT OR REPLACE INTO limit_up_pool_data (
+                        trade_date, code, name, price, change_pct, amount,
+                        limit_times, first_limit_time, last_limit_time, raw_data
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    d.get('trade_date'), d.get('code'), d.get('name'),
+                    d.get('price'), d.get('change_pct'), d.get('amount'),
+                    d.get('limit_times'), d.get('first_limit_time'), d.get('last_limit_time'),
+                    json.dumps(d.get('raw', {}), ensure_ascii=False) if d.get('raw') else None
+                ))
+                saved += 1
+            self.conn.commit()
+            return saved
+        except Exception as e:
+            logger.error(f"save_limit_up_pool 失败: {e}")
+            return saved
+
+    def get_limit_up_pool(self, trade_date: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """获取涨停池 (默认最新交易日)"""
+        if trade_date:
+            cur = self.conn.execute("""
+                SELECT * FROM limit_up_pool_data
+                WHERE trade_date = ?
+                ORDER BY change_pct DESC LIMIT ?
+            """, (trade_date, limit))
+        else:
+            cur = self.conn.execute("""
+                SELECT * FROM limit_up_pool_data
+                WHERE trade_date = (SELECT MAX(trade_date) FROM limit_up_pool_data)
+                ORDER BY change_pct DESC LIMIT ?
+            """, (limit,))
+        return [dict(r) for r in cur.fetchall()]
+
+    # ==================== DRAGON TIGER (Phase 2 新增) ====================
+
+    def save_dragon_tiger(self, data_list: List[Dict[str, Any]]) -> int:
+        """批量保存龙虎榜 (trade_date, items[])"""
+        if not data_list:
+            return 0
+        saved = 0
+        try:
+            for d in data_list:
+                self.conn.execute("""
+                    INSERT OR REPLACE INTO dragon_tiger_data (
+                        trade_date, code, name,
+                        close_price, change_pct,
+                        net_buy_amount, buy_amount, sell_amount, total_amount,
+                        period, list_count, inst_buy_net, raw_data
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    d.get('trade_date'), d.get('code'), d.get('name'),
+                    d.get('close_price'), d.get('change_pct'),
+                    d.get('net_buy_amount'), d.get('buy_amount'),
+                    d.get('sell_amount'), d.get('total_amount'),
+                    d.get('period', '今日'), d.get('list_count'), d.get('inst_buy_net'),
+                    json.dumps(d.get('raw', {}), ensure_ascii=False, default=str) if d.get('raw') else None
+                ))
+                saved += 1
+            self.conn.commit()
+            return saved
+        except Exception as e:
+            logger.error(f"save_dragon_tiger 失败: {e}")
+            return saved
+
+    def get_dragon_tiger(self, code: Optional[str] = None, days: int = 30,
+                          period: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """获取龙虎榜数据
+        code:  按股票代码过滤 (None=全部)
+        days: 最近 N 天
+        period: 按 period 过滤 (今日/近一月/...)
+        """
+        from datetime import datetime, timezone, timedelta
+        TZ = timezone(timedelta(hours=8))
+        cutoff = (datetime.now(TZ) - timedelta(days=days)).strftime('%Y-%m-%d')
+
+        sql = "SELECT * FROM dragon_tiger_data WHERE trade_date >= ?"
+        params = [cutoff]
+        if code:
+            sql += " AND code = ?"
+            params.append(code)
+        if period:
+            sql += " AND period = ?"
+            params.append(period)
+        sql += " ORDER BY trade_date DESC, net_buy_amount DESC LIMIT ?"
+        params.append(limit)
+        cur = self.conn.execute(sql, params)
+        return [dict(r) for r in cur.fetchall()]
+
+    def _dml(self, sql: str, params: tuple = ()) -> int:
+        """执行一条 DML，返回**实际影响的行数**（不依赖 cursor.rowcount）。
+
+        ⚠️ 2026-10-26：Python 3.12+ 的 sqlite3 有 **statement cache**，
+        实测（Python 3.14.4）有两个坑：
+          ① 上一次语句是 SELECT 时，后续 execute() 返回的 cursor 的
+             **rowcount 恒为 0** —— 即使 DML 真的生效了；
+          ② **同一 SQL 文本连续执行两次，第二次会静默不执行**
+             （total_changes 也不变）—— 因为复用了缓存的 prepared statement。
+        坑 ② 对"清理任务要幂等"是致命的。
+
+        对策：
+          - 用 **`Connection.total_changes` 的增量**（连接级累计计数，
+            完全不受 statement cache 影响）而不是 rowcount / SELECT changes()
+          - 给 SQL 加**唯一注释后缀**，确保每次都是新的 statement（避开缓存复用）
+        """
+        # ⚠️ 必须先 commit：实测（Python 3.14.4）**事务未结束时**同一 SQL 文本连续执行，
+        #   第二次会被 statement cache 跳过 → **静默不执行**（rowcount 与 total_changes 都不变）。
+        #   commit 后再执行则两次都正常生效。
+        try:
+            self.conn.commit()
+        except Exception:
+            pass
+        before = self.conn.total_changes
+        self.conn.execute(sql, params)
+        return int(self.conn.total_changes - before)
+
+    def _changes(self) -> int:
+        """兼容别名：取最近一条 DML 影响的行数。"""
+        return self._dml("SELECT 1") if False else int(
+            self.conn.execute("SELECT changes()").fetchone()[0] or 0)
+
+    def close(self):
+        """关闭连接"""
+        self.conn.close()
+
+# ==================== 工具函数 ====================
+
+def now_tz() -> datetime:
+    """获取当前东8区时间"""
+    return datetime.now(TZ)
+
+def parse_date(date_str: str) -> datetime:
+    """解析日期字符串为datetime（带时区）"""
+    if isinstance(date_str, datetime):
+        return date_str.astimezone(TZ) if date_str.tzinfo else date_str.replace(tzinfo=TZ)
+    # 尝试多种格式
+    for fmt in ['%Y-%m-%d', '%Y%m%d', '%Y-%m-%d %H:%M:%S']:
+        try:
+            dt = datetime.strptime(date_str, fmt)
+            return dt.replace(tzinfo=TZ)
+        except ValueError:
+            continue
+    # 最后尝试 fromisoformat
+    try:
+        dt = datetime.fromisoformat(date_str)
+        return dt.astimezone(TZ) if dt.tzinfo else dt.replace(tzinfo=TZ)
+    except:
+        raise ValueError(f"无法解析日期: {date_str}")
+
+if __name__ == "__main__":
+    # 简单测试
+    logging.basicConfig(level=logging.INFO)
+    db = Database()
+    print("数据库初始化成功")
+    stats = db.get_stats()
+    print("统计:", json.dumps(stats, indent=2, ensure_ascii=False))
+    db.close()
