@@ -22,6 +22,7 @@
 """
 import argparse
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -129,7 +130,10 @@ def main():
         # 一次性真删（内部对每张表仍是 COUNT → expect_rows 精确护栏 → DELETE）
         result = db.cleanup_old_data(ret, dry_run=False)
         # 审计：删除前后行数 + 各表实际删除数 + cutoff（批评家：删数据的操作必须有可审计记录）
-        import logging
+        # 2026-11-11 修复：这里的函数内 `import logging` 曾把 logging 变成 main() 的局部名，
+        #   导致上方 110 行首次使用时 UnboundLocalError、--apply 模式每天 03:10 必失败
+        #   （systemd unit market-db-cleanup.service 连续失败，market.db 无人清理）。
+        #   改为只用模块级 import（见文件头部），函数内不再重复导入。
         _cl = logging.getLogger("market.cleanup")
         if not _cl.handlers:
             _ch = logging.StreamHandler()
