@@ -58,10 +58,16 @@ def test_catalog_counts_match_db(catalog):
     n_limit = db.conn.execute("SELECT count(DISTINCT code) FROM limit_up_pool_data").fetchone()[0]
     assert by["limitup"]["count"] == n_limit
 
-    n_flow = db.conn.execute(
-        "SELECT count(DISTINCT symbol) FROM fund_flow_data WHERE flow_type='main_fund_rank'"
+    # fundflow 的 count 口径在 2026-11-02「指标看板定稿」时**故意**改了：
+    # L1 count = **本批**条数（最新一次采集的榜单长度），不是历史累计 DISTINCT symbol。
+    # 理由（api.py 原注释）：前端点进去只有 50 条，count 却报 2006 是欺骗性 UI；
+    # 历史累计另放 L2 的 total_history。→ 这里按**同一口径**从库实查比对。
+    n_flow_batch = db.conn.execute(
+        "SELECT COUNT(*) FROM fund_flow_data WHERE flow_type='main_fund_rank'"
+        " AND collected_at >= (SELECT datetime(max(collected_at),'-5 minutes')"
+        "   FROM fund_flow_data WHERE flow_type='main_fund_rank')"
     ).fetchone()[0]
-    assert by["fundflow"]["count"] == n_flow
+    assert by["fundflow"]["count"] == n_flow_batch, (by["fundflow"]["count"], n_flow_batch)
 
     # holdings = price_data 标的 + 近 30 天有净值的基金
     n_price = db.conn.execute("SELECT count(DISTINCT symbol) FROM price_data").fetchone()[0]
@@ -127,6 +133,26 @@ def test_l2_lists_are_capped_but_report_total():
     assert d["total"] > len(d["items"]), "资金流应有截断（total > items）"
     for it in d["items"]:
         assert it["rank"] is not None and it["name"], it
+
+
+def test_l2_fundflow_total_history_is_distinct_symbol_count():
+    """「数字诚实」契约：L2 必须同时给出历史累计 total_history = DISTINCT symbol。
+
+    L1 的 count 只报本批条数（前端只展示 50 条，报 2006 是欺骗性 UI）；
+    历史累计不能被悄悄丢掉，否则用户无法知道库里一共有多少标的。
+    """
+    db = api_mod.db
+    d = client.get("/api/v1/catalog/fundflow").json()
+    n_hist = db.conn.execute(
+        "SELECT count(DISTINCT symbol) FROM fund_flow_data WHERE flow_type='main_fund_rank'"
+    ).fetchone()[0]
+    assert d.get("total_history") == n_hist, (d.get("total_history"), n_hist)
+    # 本批条数 ≤ 历史累计（不能反超）
+    assert d["total"] <= n_hist, (d["total"], n_hist)
+    # L1 count 与 L2 total 同口径（都是本批条数）
+    c = client.get("/api/v1/catalog").json()
+    by = {x["key"]: x for x in c["categories"]}
+    assert by["fundflow"]["count"] == d["total"], (by["fundflow"]["count"], d["total"])
 
 
 def test_l2_news_sources():

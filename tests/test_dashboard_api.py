@@ -5,7 +5,9 @@
   · 结构完整性（quotes / indicators / news / health / as_of / watchlist_size）
   · 清单来自 watchlist.json（8 只：3 股票 + 5 基金）
   · 股票与基金语义不同：基金涨跌幅标 estimated=True；基金无 high/low（新高新低不适用）
-  · 数据新鲜度：stale / stale_days 存在；011612 数据过期 → stale=True
+  · 数据新鲜度：stale / stale_days 存在；**判定逻辑自洽**（stale ⟺ 超阈值）
+    （2026-11-13 修正：原先写死「011612 必须 stale」是把当时的采集停更 bug
+      当成预期；链路修好后该断言会反向逼代码误报 stale）
   · 新闻：只 4 个中文源、caijing empty 要如实上报、时间倒序、默认 ≤20 条
   · 健康：成功率 / 24h 失败数 / 降级源
   · 缓存：第二次请求 cached=True 且更快
@@ -84,12 +86,59 @@ def test_quote_fields_and_semantics(dash):
             assert "/" not in q["data_as_of"], q["data_as_of"]
 
 
-def test_stale_flag_for_stale_symbol(dash):
-    """011612 只有 20 条 nav 且 2026-10-27 后未更新 → 必须标 stale。"""
-    q = {x["symbol"]: x for x in dash["quotes"]}
-    if "011612" in q and q["011612"]["data_as_of"]:
-        assert q["011612"]["stale"] is True, q["011612"]
-        assert (q["011612"]["stale_days"] or 0) >= 4, q["011612"]
+def test_stale_flag_matches_threshold(dash):
+    """stale 判定必须与阈值自洽（阈值：股票 3 天 / 基金 4 天）。
+
+    ⚠️ 2026-11-13 修正：本测试原先断言「011612 必须 stale」——
+    那是把 **2026-10-27~11-11 的采集停更 bug 写成了预期**。
+    采集链路修复后 011612 的 nav 已更新到 2026-11-12（实测 30 条），
+    `stale=False` 是客观正确的，旧断言反而会逼着代码去误报 stale。
+    （同类问题见 test_catalog_stale_flags 里的注释「不能断言『必须 stale』」。）
+
+    现在断言**判定逻辑本身**正确，而不是某只标的的静态事实：
+      stale ⟺ stale_days 超阈值；stale_days 由 data_as_of 推导。
+    这样数据恢复或再度停更时，断言都会跟着真相走。
+    """
+    for q in dash["quotes"]:
+        threshold = 3 if q["kind"] == "stock" else 4
+        days = q["stale_days"]
+        if days is None:
+            assert q["stale"] is True, q          # 未知 → 保守判 stale
+        else:
+            assert q["stale"] == (days > threshold), (q["symbol"], q["stale"], days, threshold)
+        # stale_days 必须与 data_as_of 对得上（不能是随手填的数）
+        if q["data_as_of"]:
+            import datetime as _dt
+            # 用 api 的 TZ（+08:00）而不是本机 naive 时间，避免跨时区/跨零点漂一天
+            d = _dt.datetime.strptime(q["data_as_of"][:10], "%Y-%m-%d").replace(tzinfo=api_mod.TZ)
+            expect = (_dt.datetime.now(api_mod.TZ) - d).days
+            assert days == expect, (q["symbol"], days, expect)
+
+
+def test_no_quote_is_unexpectedly_stale(dash):
+    """所有持仓标的的 stale 状态必须能由 DB 实况解释。
+
+    若某只标的真被判 stale，必须是它的数据确实超期——
+    用 DB 里的最新时间反查，而不是硬编码「哪只该 stale」。
+    """
+    db = api_mod.db
+    for q in dash["quotes"]:
+        if not q["stale"]:
+            continue
+        sym, kind = q["symbol"], q["kind"]
+        if kind == "stock":
+            row = db.conn.execute(
+                "SELECT max(trade_time) FROM price_data WHERE symbol=?", (sym,)).fetchone()
+        else:
+            row = db.conn.execute(
+                "SELECT max(nav_date) FROM nav_data WHERE symbol=?", (sym,)).fetchone()
+        latest = str(row[0] or "")[:10]
+        assert latest, f"{sym} 被判 stale 但库里查不到任何数据时间"
+        import datetime as _dt
+        d = _dt.datetime.strptime(latest, "%Y-%m-%d").replace(tzinfo=api_mod.TZ)
+        days = (_dt.datetime.now(api_mod.TZ) - d).days
+        threshold = 3 if kind == "stock" else 4
+        assert days > threshold, (sym, "被判 stale 但库里最新数据只有", days, "天")
 
 
 def test_indicators_stock_vs_fund(dash):
