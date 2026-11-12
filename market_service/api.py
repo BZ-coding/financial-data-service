@@ -498,8 +498,11 @@ async def get_data(
                 rows = db.get_announcements(symbol, days=days)
                 if not rows:
                     raise HTTPException(404, f"未找到 {symbol} 的公告数据")
+                # 2026-11-12 修正：rows 按 announcement_time DESC 排序，rows[-1] 是**最旧**的一条；
+                # 且公告行根本没有 published/trade_time/nav_date 字段 → as_of 永远是 None。
+                # 正确取最新一条的 announcement_time。
                 return {"symbol": symbol, "items": rows, "count": len(rows), "days": days,
-                        "as_of": (rows[-1].get("published") or rows[-1].get("trade_time") or rows[-1].get("nav_date")) if rows else None,
+                        "as_of": rows[0].get("announcement_time") if rows else None,
                         "frequency": "daily"}
             elif data_type == "community":
                 days = 30

@@ -34,6 +34,20 @@ class CollectResult:
 
 from .base import BaseCollector
 
+try:
+    # 公告身份规范化助手与数据库层共用同一实现，避免两处规则漂移
+    from ..database import (
+        _canonical_announcement_link,
+        _canonical_announcement_time,
+        _extract_announcement_id,
+    )
+except ImportError:  # 平铺导入回退
+    from database import (  # type: ignore
+        _canonical_announcement_link,
+        _canonical_announcement_time,
+        _extract_announcement_id,
+    )
+
 class AKShareFetcher(BaseCollector):
     # estimate_nav 信源顺序（可由 config.yaml 的 collectors.akshare.estimate_nav_sources 覆盖）
     #   sina_fu : 新浪 fu_ 行情 —— 盘中估算净值
@@ -511,11 +525,13 @@ class AKShareFetcher(BaseCollector):
             )
             if df is not None and not df.empty:
                 result = []
-                for _, row in df.head(50).iterrows():
+                for _, row in df.head(100).iterrows():
+                    link = str(row.get('公告链接', ''))
                     result.append({
                         'title': str(row.get('公告标题', '')),
                         'announcement_time': str(row.get('公告时间', '')),
-                        'link': str(row.get('公告链接', '')),
+                        'link': link,
+                        'announcement_id': _extract_announcement_id(link),
                         'raw': row.to_dict()
                     })
                 return result
@@ -560,6 +576,8 @@ class AKShareFetcher(BaseCollector):
                     'title': title,
                     'announcement_time': ann_time,
                     'link': f'https://pdf.dfcfw.com/pdf/H2_{announce_id}_1.pdf',
+                    'announcement_id': _extract_announcement_id(
+                        f'H2_{announce_id}_1.pdf') or f'em:{announce_id}',
                     'source': 'eastmoney_fund',
                     'raw': row,
                 })
@@ -573,14 +591,22 @@ class AKShareFetcher(BaseCollector):
             return None
 
     def _normalize_announcement(self, raw: Dict[str, Any], symbol: str) -> Dict[str, Any]:
-        """标准化公告数据"""
-        ann_time = raw.get('announcement_time', '')
+        """标准化公告数据。
+
+        2026-11-12: 采集端就统一日期粒度 + 抽出稳定 announcement_id。
+        巨潮同一 announcementId 会给两种时间格式（'2026-10-10' / '2026-10-10 00:00:00'），
+        且 link 内嵌 announcementTime= 参数随之变化 → 旧 UNIQUE(link) 兜不住 → 同一公告两行。
+        """
+        link = _canonical_announcement_link(raw.get('link', ''))
+        ann_time = _canonical_announcement_time(raw.get('announcement_time', ''))
+        ann_id = raw.get('announcement_id') or _extract_announcement_id(link)
         return {
             'source': raw.get('source', 'cninfo'),
             'symbol': symbol,
             'title': raw.get('title', ''),
             'announcement_time': ann_time,
-            'link': raw.get('link', ''),
+            'link': link,
+            'announcement_id': ann_id,
             'raw': raw.get('raw', {})
         }
 

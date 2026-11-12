@@ -6,6 +6,7 @@
 
 import sqlite3
 import json
+import re
 from datetime import datetime, date, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from pathlib import Path
@@ -51,6 +52,55 @@ def convert_datetime(s: bytes) -> datetime:
 # 注册适配器
 sqlite3.register_adapter(datetime, adapt_datetime)
 sqlite3.register_converter("TIMESTAMPTZ", convert_datetime)
+
+# ========== 公告身份规范化 (2026-11-12) ==========
+# cninfo 同一 announcementId 会返回两种时间格式（'2026-10-10' 与 '2026-10-10 00:00:00'），
+# 且 link 内嵌的 announcementTime= 参数随之变化 → UNIQUE(link) 去重失效，
+# 同一公告入库两行 → 公告条数虚高 + major_event 重复告警。
+# 修复：① 稳定身份 announcement_id  ② 日期统一 YYYY-MM-DD
+#      ③ link 的 announcementTime 规范成日期粒度（保持可点击）
+_ANN_CNINFO_ID_RE = re.compile(r"announcementId=(\d+)")
+_ANN_EM_ID_RE = re.compile(r"(AN\d{10,})")
+_ANN_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+
+def _extract_announcement_id(link: str) -> Optional[str]:
+    """从公告链接提取稳定身份 ID。
+
+    cninfo (A 股): .../detail?stockCode=002202&announcementId=1225575618&...
+    东财基金 pdf: https://pdf.dfcfw.com/pdf/H2_AN202610271830984006_1.pdf
+    加来源前缀，避免不同来源的裸数字撞车。
+    """
+    if not link:
+        return None
+    m = _ANN_CNINFO_ID_RE.search(link)
+    if m:
+        return f"cninfo:{m.group(1)}"
+    m = _ANN_EM_ID_RE.search(link)
+    if m:
+        return f"em:{m.group(1)}"
+    return None
+
+
+def _canonical_announcement_time(value: Any) -> Optional[str]:
+    """公告日期统一为 YYYY-MM-DD（去时分秒）。"""
+    if value is None:
+        return None
+    m = _ANN_DATE_RE.search(str(value))
+    return m.group(1) if m else (str(value).strip() or None)
+
+
+def _canonical_announcement_link(link: str) -> str:
+    """把 link 里的动态 announcementTime 参数规范成日期粒度。"""
+    if not link:
+        return ""
+
+    def _fix(m):
+        mm = _ANN_DATE_RE.search(m.group(1))
+        return "announcementTime=%s" % (mm.group(1) if mm else m.group(1))
+
+    return re.sub(r"announcementTime=([^&]*)", _fix, link)
+
 
 class Database:
     def __init__(self, db_path: str = "data/market.db"):
@@ -231,6 +281,70 @@ class Database:
                 self.conn.commit()
             except Exception as e:
                 logger.error(f"迁移失败: {e}")
+
+        # 公告身份迁移（幂等）
+        try:
+            self._migrate_announcement_identity()
+        except Exception as e:
+            logger.error(f"公告身份迁移失败: {e}")
+
+    def _migrate_announcement_identity(self) -> None:
+        """公告身份迁移 (2026-11-12, 幂等，每次 init_tables 跑一遍)。
+
+        1) announcement_data 增加 announcement_id 列
+        2) 规范化 announcement_time(日期粒度) 与 link(去 announcementTime 动态参数)
+        3) 按稳定身份去重：同 (source, symbol, announcement_id) 保留最早 id，删其余
+        4) 建部分唯一索引 (source, symbol, announcement_id)
+        """
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(announcement_data)")}
+        if "announcement_id" not in cols:
+            self.conn.execute("ALTER TABLE announcement_data ADD COLUMN announcement_id TEXT")
+            self.conn.commit()
+            logger.info("迁移: announcement_data 增加 announcement_id 列")
+
+        rows = self.conn.execute(
+            "SELECT id, source, symbol, announcement_time, link FROM announcement_data").fetchall()
+        seen = set()
+        drop_ids = []
+        updates = []
+        for r in rows:
+            rid, source, symbol, atime, link = r[0], r[1], r[2], r[3], r[4]
+            ann_id = _extract_announcement_id(link)
+            can_link = _canonical_announcement_link(link)
+            can_time = _canonical_announcement_time(atime)
+            key = (source, symbol, ann_id) if ann_id else (source, symbol, "link:" + can_link)
+            if key in seen:
+                drop_ids.append(rid)   # 保留最早 id
+                continue
+            seen.add(key)
+            updates.append((ann_id, can_time, can_link, rid))
+        if drop_ids:
+            self.conn.executemany("DELETE FROM announcement_data WHERE id = ?",
+                                  [(i,) for i in drop_ids])
+            # 先提交去重，腾出 UNIQUE(link) 的空位，再做归一化 UPDATE
+            self.conn.commit()
+            logger.info(f"公告去重: 删除 {len(drop_ids)} 行重复公告")
+        if updates:
+            # ⚠️ announcement_data.link 有 UNIQUE 约束；归一化后若两行 canonical link
+            # 撞车（理论上同 announcementId 已被上面去重，但兜底不能整批回滚），
+            # 必须逐行容错，否则一条坏数据会让整次迁移失败、去重也白做。
+            ok = 0
+            for ann_id, can_time, can_link, rid in updates:
+                try:
+                    self.conn.execute(
+                        "UPDATE announcement_data SET announcement_id = ?, announcement_time = ?, link = ?"
+                        " WHERE id = ?", (ann_id, can_time, can_link, rid))
+                    ok += 1
+                except sqlite3.IntegrityError as e:
+                    logger.warning(f"公告归一化跳过 id={rid}: {e}")
+                    self.conn.rollback()
+            self.conn.commit()
+            logger.info(f"公告归一化: 更新 {ok}/{len(updates)} 行")
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ann_identity"
+            " ON announcement_data(source, symbol, announcement_id)"
+            " WHERE announcement_id IS NOT NULL")
+        self.conn.commit()
 
     # ==================== NAV DATA ====================
 
@@ -888,19 +1002,27 @@ class Database:
     # ==================== ANNOUNCEMENT DATA ====================
 
     def insert_announcement(self, data: Dict[str, Any]) -> bool:
-        """插入公告数据"""
+        """插入公告数据。
+
+        身份 = (source, symbol, announcement_id)；announcement_id 由 link 推导，
+        缺失时退化为 (source, symbol, canonical_link)。
+        """
+        link = _canonical_announcement_link(data.get('link', ''))
+        ann_time = _canonical_announcement_time(data.get('announcement_time'))
+        ann_id = data.get('announcement_id') or _extract_announcement_id(link)
         try:
             self.conn.execute("""
                 INSERT OR IGNORE INTO announcement_data (
-                    source, symbol, title, announcement_time, link, raw_data,
+                    source, symbol, title, announcement_time, link, announcement_id, raw_data,
                     ingested_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             """, (
                 data.get('source', 'cninfo'),
                 data['symbol'],
                 data['title'],
-                data.get('announcement_time'),
-                data['link'],
+                ann_time,
+                link,
+                ann_id,
                 json.dumps(data.get('raw', {}), ensure_ascii=False) if data.get('raw') else None
             ))
             self.conn.commit()
@@ -909,15 +1031,24 @@ class Database:
             logger.error(f"insert_announcement失败: {e}")
             return False
 
-    def get_announcements(self, symbol: str, days: int = 30) -> List[Dict[str, Any]]:
-        """获取最近公告"""
+    def get_announcements(self, symbol: str, days: int = 30,
+                          limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """获取最近公告。
+
+        2026-11-12: 原实现硬编码 LIMIT 50 —— 90 天窗口被静默砍到 50 条，
+        phase6 报告把 '50(封顶)' 当成真实条数。limit=None 表示不截断。
+        """
         start_date = (datetime.now(TZ) - timedelta(days=days)).date()
-        cur = self.conn.execute("""
+        sql = """
             SELECT * FROM announcement_data
             WHERE symbol = ? AND announcement_time >= ?
-            ORDER BY announcement_time DESC
-            LIMIT 50
-        """, (symbol, start_date))
+            ORDER BY announcement_time DESC, id DESC
+        """
+        params: List[Any] = [symbol, start_date]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        cur = self.conn.execute(sql, params)
         return [dict(row) for row in cur.fetchall()]
 
     # ==================== COMMUNITY DATA ====================

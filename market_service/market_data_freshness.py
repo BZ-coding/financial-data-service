@@ -31,6 +31,14 @@ FEISHU_TARGET = os.environ.get("PROBE_FEISHU_TARGET", "")
 
 # —— 阈值（偏宽松，优先不误报）——
 ACTIVE_SOURCE_MAX_STALE_MIN = 180   # 活跃源最近成功超过 3 小时 → 异常
+# ---- 源级 cadence 阈值（2026-11-12 phase6 修复）----
+# 根因：hkex_enhanced / news_aggregator / csindex 的订阅都是 **daily / weekly**，
+# 但旧逻辑对所有非行情源统一套 180 分钟「准实时」阈值 → 必然假 STALE。
+#   实测 2026-11-12：hkex_enhanced 423min、csindex 865min、news_aggregator 1122min 被判 STALE。
+# 现在阈值按**该源实际喂的订阅 cadence** 推导：threshold = max(180, 最快订阅周期 × 2)，
+# 即「允许漏一个周期再报警」。这不是拍脑袋放宽，而是从 subscriptions.frequency_min 实测推导。
+# ⚠️ 仍保留 180 分钟下限：准实时源（rss/zhihu/community_enhanced 等）行为完全不变。
+SOURCE_CADENCE_TOLERANCE = 2
 FAIL_RATE_WINDOW_MIN = 60            # 失败率统计窗口 1 小时
 FAIL_RATE_THRESHOLD = 0.85          # 全局失败率 > 85% → 异常（保留参考）
 
@@ -462,6 +470,74 @@ def parse_ts(s):
         return None
 
 
+def _load_source_cadence(cur, cutoff):
+    """source → {"cadence": 最快订阅周期(分钟), "backups": {备源名...}}
+
+    数据来源：collection_log JOIN subscriptions（只算 enabled=1 的订阅，
+    停用订阅不参与判据）。cadence 取该源下**最快**的订阅周期 —— 因为
+    源级"最近成功"是所有子订阅的聚合，源整体至少要按最快的那条节奏刷新。
+    """
+    out = {}
+    try:
+        cur.execute("""
+            SELECT DISTINCT cl.source, s.frequency_min, s.backup_sources
+            FROM collection_log cl
+            JOIN subscriptions s ON s.id = cl.subscription_id
+            WHERE cl.started_at >= ? AND s.enabled = 1
+        """, (cutoff,))
+    except sqlite3.Error:
+        return out
+    for source, freq, backups in cur.fetchall():
+        try:
+            f = int(freq or 0)
+        except (TypeError, ValueError):
+            f = 0
+        if f <= 0:
+            continue
+        rec = out.setdefault(source, {"cadence": f, "backups": set()})
+        if f < rec["cadence"]:
+            rec["cadence"] = f
+        for b in str(backups or "").split(","):
+            b = b.strip()
+            if b:
+                rec["backups"].add(b)
+    return out
+
+
+def _source_stale_threshold(src, cadence_map):
+    """该源的陈旧阈值（分钟）：max(180, 最快订阅周期 × 2)。"""
+    rec = cadence_map.get(src)
+    if not rec:
+        return ACTIVE_SOURCE_MAX_STALE_MIN
+    return max(ACTIVE_SOURCE_MAX_STALE_MIN, int(rec["cadence"]) * SOURCE_CADENCE_TOLERANCE)
+
+
+def _last_success_since(cur, source, since):
+    """该源在 since 之后最近一次成功采集时间（本地时间串）。"""
+    try:
+        cur.execute(
+            "SELECT MAX(started_at) FROM collection_log "
+            "WHERE source = ? AND status = 'success' AND started_at >= ?",
+            (source, since.strftime("%Y-%m-%d %H:%M:%S")))
+        return cur.fetchone()[0]
+    except sqlite3.Error:
+        return None
+
+
+def _backup_covered(cur, src, cadence_map, now, thr):
+    """主源超期但**备源**在阈值内成功 → 返回备源名（视为已覆盖，不算 STALE）。
+
+    备源关系来自 subscriptions.backup_sources（真实配置，不是猜的）。
+    """
+    rec = cadence_map.get(src) or {}
+    for b in sorted(rec.get("backups") or ()):
+        if b == src:
+            continue
+        if _last_success_since(cur, b, now - timedelta(minutes=thr)):
+            return b
+    return None
+
+
 def main():
     problems = []
     now = datetime.now(timezone(timedelta(hours=8)))
@@ -496,14 +572,33 @@ def main():
         """, (cutoff,))
         active = [r[0] for r in cur.fetchall() if r[0] != "chain"]
 
+        # 2026-11-12 phase6：按订阅 cadence 推导每个源的陈旧阈值（修 daily/weekly 假 STALE）
+        cadence_map = _load_source_cadence(cur, cutoff)
+
         log(f"--- 活跃源 {len(active)} 个，近24h有成功记录的 {len(fresh)} 个 ---")
         for src in sorted(active):
             last = fresh.get(src)
             ts = parse_ts(last)
             is_market_src = src in MARKET_SOURCES
+            thr = _source_stale_threshold(src, cadence_map)
             if ts is None:
                 # 近 24h 内无成功记录
                 skip_alert = (not market_open) and is_market_src
+                if thr > 1440 and not is_market_src:
+                    # ⚠️ 2026-11-12：daily/weekly 源 24h 内无成功是**正常**的
+                    # （hkex_enhanced/news_aggregator/csindex）—— 回查 thr 窗口再判，
+                    # 避免把日更源误报成故障源。
+                    last2 = _last_success_since(cur, src, now - timedelta(minutes=thr))
+                    ts2 = parse_ts(last2)
+                    if ts2 is not None:
+                        age2 = (now - ts2).total_seconds() / 60
+                        log(f"  [OK ] {src}: 最近成功 {last2}（{age2:.0f} 分钟前，"
+                            f"日/周频源阈值 {thr} 分钟）")
+                        continue
+                    log(f"  [WARN] 源 {src}: 近 {thr} 分钟（日/周频阈值）无成功记录")
+                    if src in CORE_SOURCES:
+                        problems.append(f"核心源 {src} 近 {thr} 分钟无任何成功采集")
+                    continue
                 log(f"  [{'WARN(非交易日-忽略)' if skip_alert else 'WARN'}] 源 {src}: 近24h无成功记录")
                 if src in CORE_SOURCES and not skip_alert:
                     problems.append(f"核心源 {src} 近 24 小时无任何成功采集")
@@ -532,13 +627,20 @@ def main():
             # 非行情源（新闻/社区等，7×24 运行）：按墙钟
             skip_alert = (not market_open) and is_market_src
             mark = "OK "
-            if age_min > ACTIVE_SOURCE_MAX_STALE_MIN:
-                mark = "STALE(非交易日-忽略)" if skip_alert else "STALE"
-                if src in CORE_SOURCES and not skip_alert:
-                    problems.append(
-                        f"核心源 {src} 最近成功在 {age_min:.0f} 分钟前"
-                        f"（超过 {ACTIVE_SOURCE_MAX_STALE_MIN} 分钟阈值）")
-            log(f"  [{mark}] {src}: 最近成功 {last}（{age_min:.0f} 分钟前）")
+            if age_min > thr:
+                # ⚠️ 2026-11-12：阈值改为按订阅 cadence 推导（daily/weekly 源不再假 STALE）
+                covered = _backup_covered(cur, src, cadence_map, now, thr)
+                if covered:
+                    mark = "OK(备源已覆盖)"
+                    log(f"  [OK(备源已覆盖)] {src}: 主源已 {age_min:.0f} 分钟未成功，"
+                        f"但备源 {covered} 在 {thr} 分钟内成功")
+                else:
+                    mark = "STALE(非交易日-忽略)" if skip_alert else "STALE"
+                    if src in CORE_SOURCES and not skip_alert:
+                        problems.append(
+                            f"核心源 {src} 最近成功在 {age_min:.0f} 分钟前"
+                            f"（超过 {thr} 分钟阈值）")
+            log(f"  [{mark}] {src}: 最近成功 {last}（{age_min:.0f} 分钟前，阈值 {thr} 分钟）")
 
         # ---- 指标 2：近 1 小时失败率（全局，仅参考） ----
         w = (now - timedelta(minutes=FAIL_RATE_WINDOW_MIN)).strftime("%Y-%m-%d %H:%M:%S")

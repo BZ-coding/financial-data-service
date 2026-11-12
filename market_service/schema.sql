@@ -159,12 +159,20 @@ CREATE TABLE IF NOT EXISTS announcement_data (
     title TEXT NOT NULL,
     announcement_time TEXT,
     link TEXT NOT NULL UNIQUE,
+    announcement_id TEXT,
     raw_data TEXT,
     ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_ann_lookup ON announcement_data(symbol, announcement_time DESC);
+-- 公告稳定身份：(source, symbol, announcement_id)
+-- ⚠️ 2026-11-12: announcement_id 列 + idx_ann_identity 唯一索引**不能写在这里**。
+--    schema.sql 用 CREATE TABLE IF NOT EXISTS —— 老库已有 announcement_data 表时
+--    不会补列，而本文件后续的 CREATE INDEX 会因「列不存在」直接让
+--    init_tables 整段失败（实测 2026-11-12: no such column: announcement_id）。
+--    现在统一由 database.py 的 _migrate_announcement_identity() 负责：
+--    先 ALTER TABLE 补列 → 再建部分唯一索引。全新库同样会由该迁移建好。
 CREATE INDEX IF NOT EXISTS idx_ann_cleanup ON announcement_data(ingested_at);
 
 -- ============================================
