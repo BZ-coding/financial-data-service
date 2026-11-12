@@ -510,17 +510,21 @@ def _check_identity_uniqueness(cur):
     problems = []
     for table, keys in IDENTITY_UNIQUENESS_TABLES.items():
         key_expr = ", ".join(keys)
+        # 身份键为 NULL 的行不能参与分组（SQLite 会把所有 NULL 归成同一组，
+        # 把「缺身份的行数」误算成「重复行数」——数字会被严重放大）。
+        # 缺身份的行由下面 announcement_id 空值检查单独报。
+        not_null = " AND ".join(f"{k} IS NOT NULL" for k in keys)
         try:
             total = cur.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             groups = cur.execute(
-                f"SELECT COUNT(*) FROM (SELECT {key_expr} FROM {table} "
+                f"SELECT COUNT(*) FROM (SELECT {key_expr} FROM {table} WHERE {not_null} "
                 f"GROUP BY {key_expr} HAVING COUNT(*) > 1)").fetchone()[0]
         except sqlite3.Error as e:
             log(f"  [WARN] 表 {table} 唯一性检查不可读: {e}")
             continue
         dup_rows = cur.execute(
             f"SELECT COALESCE(SUM(n - 1), 0) FROM (SELECT COUNT(*) AS n FROM {table} "
-            f"GROUP BY {key_expr} HAVING COUNT(*) > 1)").fetchone()[0]
+            f"WHERE {not_null} GROUP BY {key_expr} HAVING COUNT(*) > 1)").fetchone()[0]
         if dup_rows:
             problems.append(
                 f"表 {table} 存在重复业务身份（{key_expr}）：{dup_rows} 行是重复副本"

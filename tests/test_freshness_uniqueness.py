@@ -192,3 +192,46 @@ def test_missing_announcement_id_is_flagged(tmp_path):
     problems = _check_identity_uniqueness(con)
     assert any("announcement_id" in p for p in problems), problems
     con.close()
+
+
+def test_null_identity_rows_are_not_counted_as_duplicates(tmp_path):
+    """身份键为 NULL 的行**不能**参与分组统计。
+
+    SQLite 会把所有 NULL 归成同一组 → 若不排除，「缺身份的行数」会被误算成
+    「重复行数」（实测 413 行缺身份被报成 428 行重复，严重放大）。
+    缺身份的行由 announcement_id 空值检查单独报。
+    """
+    con = _conn(tmp_path, with_constraints=False)
+    for i in range(3):
+        _ins_ann(con, source="em", symbol="002202", title=f"公告{i}",
+                  atime="2026-11-12", link=f"http://pdf/{i}", ann_id=None)
+    _ins_ann(con, source="cninfo", symbol="002202", title="正常公告",
+              atime="2026-11-12", link="http://x/1", ann_id="cninfo:1")
+    con.commit()
+
+    problems = _check_identity_uniqueness(con)
+    # 重复行数应为 0（没有两个非空身份重复）；只报缺身份这一条
+    dup_problems = [p for p in problems if "重复业务身份" in p]
+    assert dup_problems == [], dup_problems
+    assert any("缺 announcement_id" in p for p in problems), problems
+    con.close()
+
+
+def test_duplicate_count_matches_actual_extra_rows(tmp_path):
+    """报出的重复行数必须等于「多出来的行数」，不是组数也不是被放大的数字。"""
+    con = _conn(tmp_path, with_constraints=False)
+    # 3 行同一身份 → 多出 2 行；另 2 行另一身份 → 多出 1 行；合计多出 3 行
+    for i in range(3):
+        _ins_ann(con, source="cninfo", symbol="002202", title="A",
+                  atime=f"2026-11-1{i}", link=f"http://x/a{i}", ann_id="cninfo:1")
+    for i in range(2):
+        _ins_ann(con, source="cninfo", symbol="002202", title="B",
+                  atime=f"2026-11-2{i}", link=f"http://x/b{i}", ann_id="cninfo:2")
+    con.commit()
+
+    problems = _check_identity_uniqueness(con)
+    dup = [p for p in problems if "重复业务身份" in p]
+    assert len(dup) == 1, problems
+    assert "3 行是重复副本" in dup[0], dup[0]
+    assert "重复身份组 2" in dup[0], dup[0]
+    con.close()
