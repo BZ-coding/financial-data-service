@@ -222,7 +222,60 @@ sudo systemctl start market_service
 
 ---
 
-## 8. 调用方注意事项
+## 8. 新鲜度探针（market_data_freshness.py）
+
+每 30 分钟跑一次（systemd timer `market-freshness-probe.timer`），日志在
+`logs/market-data-freshness.log`，异常时推飞书告警（hermes agent 群，与 dsa-mcp
+金融告警同一目标）。
+
+### 8.1 六项指标
+
+| # | 指标 | 判据 | 回答的问题 |
+|---|------|------|-----------|
+| 1 | 各活跃源最近成功时间 | 超过该源阈值未成功 | 某个源静默坏了 |
+| 2 | 全局失败率（近 60min） | > 85% | 采集链路整体退化 |
+| 2b | 分 source 失败率（近 24h） | 成功率 < 80% | 全局混合会把小源的问题稀释掉 |
+| 3 | 核心表行数增量 | 近 60min 新增 < 1 | 表停止写入 |
+| 4 | 新闻类采集器成功次数 | 近 60min 成功 0 次 | news_data 行数受 UNIQUE 去重约束，不能用行数判存活 |
+| 5 | 重复错误率（近 24h） | 同一错误占比 ≥ 70% | 接口稳定返回无效内容（非网络抖动） |
+| 6 | **业务身份唯一性** | 行数 ≠ distinct 身份数 | **同一实体被存了多份（重复入库）** |
+
+### 8.2 指标 6 为什么必须独立存在（2026-11-13 补）
+
+2026-11-10 公告表出现重复入库（002202 实测 135 行 / 89 标题），**两个多月没人发现**，
+原因是三层盲区叠加：
+
+1. **探针只查「活没活」，从不查「是不是同一件事存了多份」**——而重复入库恰恰让表
+   **长得更快**，行数增量指标只会认为「更健康」；公告表当时甚至完全不在 CORE_TABLES 里。
+2. **探针当时是干跑模式**（`PROBE_DRY_RUN=1` 自 2026-10-26）且 `PROBE_FEISHU_TARGET`
+   从未配置 → 就算判出异常也推不出去，只有日志。
+3. **数据库层没有业务唯一约束兜底**（老库 `UNIQUE(link)` 拦不住链接变体）。
+
+现在这三层都补上了：
+- 指标 6 直接查「行数 vs distinct 身份数」，与「活没活」正交；
+- 探针已退出干跑（`~/.config/systemd/user/market-freshness-probe.service.d/alert.conf`
+  设 `PROBE_DRY_RUN=0` + `PROBE_FEISHU_TARGET`）；
+- announcement_data 有 `announcement_id` 列 + `(source, symbol, announcement_id)` 部分唯一索引。
+
+**身份键必须与表上的业务唯一约束完全一致（含 source 列）**：少一列会把不同来源的同一
+实体误判成重复（假警），多一列会漏掉真重复。
+
+### 8.3 手工跑一次
+
+```bash
+# 干跑（只写日志，不推送）
+PROBE_DRY_RUN=1 market_service/venv/bin/python market_service/market_data_freshness.py
+
+# 实跑（会推飞书）
+systemctl --user start market-freshness-probe.service
+journalctl --user -u market-freshness-probe -n 30 --no-pager
+```
+
+退出码 0 = 全部正常，1 = 检测到问题（unit 里 `SuccessExitStatus=0 1`，不算 systemd 故障）。
+
+---
+
+## 9. 调用方注意事项
 
 调用API时，如果失败：
 1. **先检查服务健康**: `curl http://127.0.0.1:8084/api/v1/stats`
@@ -232,5 +285,5 @@ sudo systemctl start market_service
 
 ---
 
-**文档版本**: v1.0
-**最后更新**: 2026-04-07
+**文档版本**: v1.1
+**最后更新**: 2026-11-13
