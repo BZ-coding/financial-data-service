@@ -545,36 +545,38 @@ async def get_data(
                 return {"symbol": code, "period": period, "days": days, "items": rows, "count": len(rows)}
             elif data_type == "stock_news":
                 # 个股新闻 (东方财富/雪球); 支持港股 fallback (akshare 无公告)
+                #
+                # 2026-11-12 港股公告出口修复：
+                #   旧实现按 ingested_at（入库时刻，UTC）过滤+排序 → 采集晚的旧公告被
+                #   排到最新位置，且窗口混进更早发布的旧公告；还固定 LIMIT 50 静默截断。
+                #   现在统一按 published（发布时刻）归一后过滤+排序，limit 可参数化。
                 days = int(request.query_params.get("days", 30))
-                limit = int(request.query_params.get("limit", 50))
-                from datetime import datetime, timezone, timedelta
-                TZ = timezone(timedelta(hours=8))
-                cutoff = (datetime.now(TZ) - timedelta(days=days)).isoformat()
-                cur = db.conn.execute("""
-                    SELECT id, source, title, summary, link, symbol, published, ingested_at
-                    FROM news_data
-                    WHERE symbol = ? AND ingested_at >= ?
-                    ORDER BY ingested_at DESC
-                    LIMIT ?
-                """, (symbol, cutoff, limit))
-                rows = [dict(r) for r in cur.fetchall()]
-                return {"symbol": symbol, "days": days, "items": rows, "count": len(rows)}
+                limit_param = request.query_params.get("limit")
+                limit = int(limit_param) if limit_param is not None else None
+                rows = db.get_news_by_published(symbol, days=days, limit=limit)
+                if not rows:
+                    raise HTTPException(404, f"未找到 {symbol} 的新闻数据")
+                return {"symbol": symbol, "days": days, "items": rows, "count": len(rows),
+                        "as_of": rows[0].get("published_date") if rows else None,
+                        "frequency": "daily"}
             elif data_type == "hkex_announcement":
                 # 港交所披露易公告 (Phase 7, 2026-07-06) — source='hkex' 区分 stock_news
+                #
+                # 2026-11-12 港股公告出口修复：
+                #   ① 窗口/排序改用 published（发布时刻）而非 ingested_at（入库时刻）；
+                #   ② as_of 由最新一条的 published 派生（原来完全没有 as_of）；
+                #   ③ 去掉固定 LIMIT 50 静默截断（limit 可显式传）；
+                #   ④ 输出带 published_at / published_date 归一字段（published 原值保留）。
                 days = int(request.query_params.get("days", 90))
-                limit = int(request.query_params.get("limit", 50))
-                from datetime import datetime, timezone, timedelta
-                TZ = timezone(timedelta(hours=8))
-                cutoff = (datetime.now(TZ) - timedelta(days=days)).isoformat()
-                cur = db.conn.execute("""
-                    SELECT id, source, title, summary, link, symbol, published, ingested_at
-                    FROM news_data
-                    WHERE symbol = ? AND source = 'hkex' AND ingested_at >= ?
-                    ORDER BY ingested_at DESC
-                    LIMIT ?
-                """, (symbol, cutoff, limit))
-                rows = [dict(r) for r in cur.fetchall()]
-                return {"symbol": symbol, "days": days, "items": rows, "count": len(rows), "source_filter": "hkex"}
+                limit_param = request.query_params.get("limit")
+                limit = int(limit_param) if limit_param is not None else None
+                rows = db.get_news_by_published(symbol, days=days, source="hkex", limit=limit)
+                if not rows:
+                    raise HTTPException(404, f"未找到 {symbol} 的港交所公告数据")
+                return {"symbol": symbol, "days": days, "items": rows, "count": len(rows),
+                        "source_filter": "hkex",
+                        "as_of": rows[0].get("published_date") if rows else None,
+                        "frequency": "daily"}
             else:
                 raise HTTPException(400, f"不支持的数据类型: {data_type}")
     except HTTPException:
@@ -626,27 +628,27 @@ async def get_news_aggregator():
 async def get_news_by_symbol(
     symbol: str = Query(..., description="股票代码"),
     days: int = Query(7, ge=1, le=90, description="最近 N 天"),
-    source: str = Query(None, description="可选，按来源过滤 (akshare/rss/community_enhanced)")
+    source: str = Query(None, description="可选，按来源过滤 (akshare/rss/community_enhanced)"),
+    limit: int = Query(200, ge=1, le=2000, description="最多返回条数")
 ):
     """按股票代码查询个股新闻（聚合 akshare + community_enhanced + rss）
 
     返回该 symbol 在 news_data 表中的最近 N 天新闻。
     注: news_data.symbol 由 collector 写入时填充，部分历史数据可能为空。
+
+    2026-11-12：时间窗与排序改用 `published`（发布时刻），不再用 `ingested_at`
+    （入库时刻）；并补 `as_of`。详见 database.get_news_by_published。
     """
     try:
-        from datetime import datetime, timezone, timedelta
-        TZ = timezone(timedelta(hours=8))
-        cutoff = (datetime.now(TZ) - timedelta(days=days)).isoformat()
-        cur = db.conn.execute("""
-            SELECT id, source, title, summary, link, symbol, published, ingested_at
-            FROM news_data
-            WHERE symbol = ? AND ingested_at >= ?
-              AND (? IS NULL OR source = ?)
-            ORDER BY ingested_at DESC
-            LIMIT 200
-        """, (symbol, cutoff, source, source))
-        rows = [dict(r) for r in cur.fetchall()]
-        return {"symbol": symbol, "days": days, "source": source, "items": rows, "count": len(rows)}
+        rows = db.get_news_by_published(
+            symbol, days=days, source=source or None, limit=limit)
+        if not rows:
+            raise HTTPException(404, f"未找到 {symbol} 的新闻数据")
+        return {"symbol": symbol, "days": days, "source": source, "items": rows,
+                "count": len(rows), "as_of": rows[0].get("published_date") if rows else None,
+                "frequency": "daily"}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"按 symbol 查新闻失败: {e}")
         raise HTTPException(500, str(e))
@@ -2121,17 +2123,17 @@ async def get_detail(symbol: str = Query(..., description="标的代码（来自
         stale_days = _stale_days(quote.get("data_as_of"))
 
         # 该标的的新闻（只有个股新闻表覆盖到的才有）
+        # 2026-11-12：改用 published 归一后的发布时间排序（原来直接 ORDER BY published
+        # 字符串，unix 秒 / ISO / 空格 4 种格式混排时顺序是错的）。
         news_items = []
         try:
-            rows = db.conn.execute(
-                "SELECT source, title, link, published FROM news_data WHERE symbol = ? "
-                "ORDER BY published DESC LIMIT 10", (sym,)).fetchall()
+            rows = db.get_news_by_published(sym, days=3650, limit=10)
             for r in rows:
-                ts = _norm_news_ts(r[3])
-                if not ts or not r[1]:
+                if not r.get("title"):
                     continue
-                news_items.append({"ts": ts, "source": r[0], "title": str(r[1])[:160],
-                                   "url": r[2]})
+                news_items.append({"ts": r.get("published_at"),
+                                   "source": r.get("source"), "title": str(r["title"])[:160],
+                                   "url": r.get("link")})
         except Exception:
             pass
 

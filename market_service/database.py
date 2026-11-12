@@ -102,6 +102,60 @@ def _canonical_announcement_link(link: str) -> str:
     return re.sub(r"announcementTime=([^&]*)", _fix, link)
 
 
+# ── news_data.published 归一（2026-11-12 港股公告出口修复）────────────────
+#
+# 实测库里 published 有 4 种格式（news_data 5486 行实测）：
+#   · hkex        '2026-11-10T20:36:00+08:00'  ← ISO + 时区偏移
+#   · 财联社/知乎  '2026-11-10 20:36:00'         ← 空格分隔
+#   · 新浪财经A股  '1762000000'                  ← unix 秒（10 位）
+#   · 央视新闻    '20261110'                     ← YYYYMMDD（8 位）
+# 排序/过滤必须先归一，否则字符串比较会错。
+#
+# ⚠️ 时区口径：published 带 +08:00 偏移（本地时间）；ingested_at 是 SQLite
+#    CURRENT_TIMESTAMP（**UTC**）。两者不可直接字符串比较。
+def _published_datetime(value: Any, naive_tz=timezone(timedelta(hours=8))) -> Optional[datetime]:
+    """把 published / ingested_at 解析成带时区的 datetime（转换到 naive_tz 口径）。
+
+    解析不出来 → None（调用方决定丢弃或回落，**不猜时间**）。
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=naive_tz)
+    s = str(value).strip()
+    if not s:
+        return None
+    if s.isdigit():
+        if len(s) == 8:                      # YYYYMMDD
+            try:
+                return datetime.strptime(s, "%Y%m%d").replace(tzinfo=naive_tz)
+            except ValueError:
+                return None
+        try:
+            n = float(s)
+        except ValueError:
+            return None
+        if n > 1e11:                        # 毫秒
+            n /= 1000.0
+        try:
+            return datetime.fromtimestamp(n, naive_tz)
+        except (OSError, OverflowError, ValueError):
+            return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", s)
+        if not m:
+            return None
+        try:
+            dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=naive_tz)
+    return dt.astimezone(naive_tz)
+
+
 class Database:
     def __init__(self, db_path: str = "data/market.db"):
         self.db_path = Path(db_path)
@@ -937,6 +991,68 @@ class Database:
             LIMIT 50
         """, (start_time,))
         return [dict(row) for row in cur.fetchall()]
+
+    def get_news_by_published(
+        self,
+        symbol: str,
+        days: int = 90,
+        source: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """按 **published（发布时刻）** 过滤+排序地取 news_data。
+
+        2026-11-12 港股公告出口修复（根因在读取语义，不是写入侧重复）：
+
+        1. 旧实现按 `ingested_at`（入库时刻，UTC）过滤和排序 →
+           - 采集晚的旧公告被排到最新位置（hk09988 实测：最新 published
+             2026-11-10 被排第 2，首位是 2026-10-07）；
+           - 90 天窗口混进更早发布的旧公告（hk03690 实测多出 6 条）。
+           → 现在窗口与排序一律用 `published`。
+        2. `published` 在库里混有 4 种格式（unix 秒 4883 行 / ISO+08:00 413 行 /
+           'YYYY-MM-DD HH:MM:SS' 122 行 / YYYYMMDD 1 行），字符串比较会错 →
+           统一用 `_published_datetime()` 归一到 +08:00 再比较。
+        3. 原来固定 `LIMIT 50` 会静默截断 → `limit=None` 表示不截断
+           （调用方可显式传 limit）。
+
+        返回行额外带：
+          published_at   —— 归一后的本地时间 'YYYY-MM-DD HH:MM:SS'
+          published_date —— 日期粒度 'YYYY-MM-DD'
+          time_source    —— 'published' 或 'ingested_at'（published 解析不了时的兜底口径）
+        """
+        cutoff = datetime.now(TZ) - timedelta(days=days)
+        sql = ("SELECT id, source, title, summary, link, symbol, published, ingested_at "
+               "FROM news_data WHERE symbol = ?")
+        params: List[Any] = [symbol]
+        if source:
+            sql += " AND source = ?"
+            params.append(source)
+        rows = [dict(r) for r in self.conn.execute(sql, params).fetchall()]
+
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            dt = _published_datetime(r.get("published"))
+            time_source = "published"
+            if dt is None:
+                # published 缺失/无法解析 → 退回入库时刻（明确标注口径，不静默）
+                dt = _published_datetime(r.get("ingested_at"), naive_tz=timezone.utc)
+                time_source = "ingested_at"
+            if dt is None:
+                continue
+            if dt < cutoff:
+                continue
+            r["published_at"] = dt.strftime("%Y-%m-%d %H:%M:%S")
+            r["published_date"] = dt.strftime("%Y-%m-%d")
+            r["time_source"] = time_source
+            r["_sort_ts"] = dt
+            out.append(r)
+
+        # 发布时刻倒序；同一时刻用 id 兜底，保证稳定
+        out.sort(key=lambda x: (x["_sort_ts"], x.get("id") or 0), reverse=True)
+        for r in out:
+            r.pop("_sort_ts", None)
+        if limit is not None and limit >= 0:
+            out = out[:limit]
+        return out
 
     def insert_index(self, data: Dict[str, Any]) -> bool:
         """插入指数数据（支持批量）"""
