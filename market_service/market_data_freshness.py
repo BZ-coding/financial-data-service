@@ -142,6 +142,37 @@ NEWS_TABLES = {"news_data"}
 MARKET_SOURCES = {"akshare", "sina", "eastmoney_em", "tickflow", "massive", "tencent"}
 MARKET_TABLES = {"price_data", "minute_data"}
 
+# ---- 指标 6：业务身份唯一性（2026-11-13 补：重复入库的检测盲区）----
+#
+# 为什么之前没发现公告重复入库（002202 实测 135 行 / 89 标题）：
+#   探针原本**只查"活没活"**（源有没有成功、表有没有长行），从不查
+#   "同一件事是不是被当成多件事存了"。而重复入库恰恰让表**长得更快**——
+#   行数增量指标只会认为"更健康"，永远不会报警。
+#   公告表甚至完全不在 CORE_TABLES 里，探针连它的行数都不看。
+#
+# 现在补一条**与"活没活"正交**的指标：每张有业务身份键的表，
+# 行数必须等于 distinct 身份数；不等 = 同一实体存了多份 = 重复入库。
+#
+# 身份键定义（来自各表的真实业务语义，不是猜的）：
+#   announcement_data → (source, symbol, announcement_id)  2026-11-12 起 announcement_id 是稳定身份
+#   news_data          → link（表上有 UNIQUE 约束，仍复查）
+#   price_data         → (symbol, trade_time)
+#
+# ⚠️ 阈值：只报"确实多了行"（dup_rows > 0），不做比例判断——
+#   宁可多报一次，也不给假警把人淹了。
+#   price_data         → (source, symbol, trade_time)  表上有 UNIQUE 约束，复查
+#
+# ⚠️ 身份键必须与表上的业务唯一约束**完全一致**（含 source 列）——
+#   少一列会把不同来源的同一实体误判成重复（假警），多一列会漏掉真重复。
+IDENTITY_UNIQUENESS_TABLES = {
+    "announcement_data": ("source", "symbol", "announcement_id"),
+    "news_data": ("link",),
+    "price_data": ("source", "symbol", "trade_time"),
+}
+# announcement_data 里 announcement_id 为空的行：身份键缺失，无法判定唯一性，
+#   单独计数告警（这类行一旦变多，就是身份抽取逻辑退化的信号）。
+ANNOUNCEMENT_ID_NULL_LIMIT = 0
+
 CALENDAR_CACHE = "/home/zsd/financial-data-service/market_service/data/trade_calendar.json"
 CALENDAR_MAX_AGE_H = 24 * 7   # 日历缓存 7 天
 
@@ -468,6 +499,48 @@ def parse_ts(s):
         return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except Exception:
         return None
+
+
+def _check_identity_uniqueness(cur):
+    """指标 6：业务身份唯一性。返回问题描述列表（空 = 通过）。
+
+    与"活没活"正交：重复入库会让表行数**变多**，行数增量指标因此认为更健康，
+    永远发现不了。唯一性检查是唯一能看见这类静默重复的指标。
+    """
+    problems = []
+    for table, keys in IDENTITY_UNIQUENESS_TABLES.items():
+        key_expr = ", ".join(keys)
+        try:
+            total = cur.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            groups = cur.execute(
+                f"SELECT COUNT(*) FROM (SELECT {key_expr} FROM {table} "
+                f"GROUP BY {key_expr} HAVING COUNT(*) > 1)").fetchone()[0]
+        except sqlite3.Error as e:
+            log(f"  [WARN] 表 {table} 唯一性检查不可读: {e}")
+            continue
+        dup_rows = cur.execute(
+            f"SELECT COALESCE(SUM(n - 1), 0) FROM (SELECT COUNT(*) AS n FROM {table} "
+            f"GROUP BY {key_expr} HAVING COUNT(*) > 1)").fetchone()[0]
+        if dup_rows:
+            problems.append(
+                f"表 {table} 存在重复业务身份（{key_expr}）：{dup_rows} 行是重复副本"
+                f"（总行数 {total}，重复身份组 {groups}）—— 同一实体被存了多份")
+        else:
+            log(f"  [OK ] {table}: 业务身份唯一（{key_expr}），总行数 {total}")
+    # announcement_id 缺失：身份键空 → 去重靠不住，是退化信号
+    try:
+        null_ann = cur.execute(
+            "SELECT COUNT(*) FROM announcement_data WHERE announcement_id IS NULL "
+            "OR announcement_id = ''").fetchone()[0]
+        if null_ann > ANNOUNCEMENT_ID_NULL_LIMIT:
+            problems.append(
+                f"announcement_data 有 {null_ann} 行缺 announcement_id（稳定身份缺失）"
+                f"—— 这些行只能靠 link 去重，跨链接变体无法识别重复")
+        else:
+            log(f"  [OK ] announcement_data: 无缺失 announcement_id 的行")
+    except sqlite3.Error as e:
+        log(f"  [WARN] announcement_id 空值检查不可读: {e}")
+    return problems
 
 
 def _load_source_cadence(cur, cutoff):
@@ -800,6 +873,10 @@ def main():
             if grew < MIN_ROW_GROWTH and not skip_alert:
                 problems.append(
                     f"表 {tbl} 近 {FAIL_RATE_WINDOW_MIN} 分钟新增 {grew} 行（低于 {MIN_ROW_GROWTH}），数据可能已停止写入")
+
+        # ---- 指标 6：业务身份唯一性（重复入库检测）----
+        log("--- 业务身份唯一性（重复入库检测）---")
+        problems.extend(_check_identity_uniqueness(cur))
 
         # ---- 指标 4：新闻类采集器成功次数（news_data 的真实存活判据）----
         nw = (now - timedelta(minutes=NEWS_COLLECTOR_WINDOW_MIN)).strftime("%Y-%m-%d %H:%M:%S")
