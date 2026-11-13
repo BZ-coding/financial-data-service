@@ -447,6 +447,74 @@ class CommunityEnhancedCollector(BaseCollector):
             self.logger.warning(f"_fetch_sector_fund_flow({kind}) 异常: {e}")
             return None
 
+    def _fetch_sector_fund_flow_ths(self, kind: str = "industry", top_n: int = 500) -> Optional[List[Dict[str, Any]]]:
+        """板块资金流兜底：同花顺口径（akshare）。
+
+        2026-11-13 新增。东财 push2delay 对本机出口 IP 的封禁在恶化
+        （实测成功率 11-10 100% → 11-11 82% → 11-12 10% → 11-13 3%，
+        独立进程复测 12 次只有 3 次成功），而 akshare 的同花顺口径
+        （stock_fund_flow_industry / stock_fund_flow_concept）**不受影响**
+        （实测行业 90 条 0.5s、概念 387 条 1.0s）。
+
+        字段对齐东财口径（保持下游不变）：
+          东财   f3=涨跌幅×100 / f62=主力净流入(元) / f184=占比×100
+          同花顺 行业-涨跌幅=百分数 / 净额=**亿元** / 领涨股 / 领涨股-涨跌幅=百分数
+        量纲差异：同花顺给的是**净额(亿元)**而非东财的**主力净流入(元)**，
+        统一换算成元；同花顺不提供占比 → main_net_pct 留空（下游按缺失处理）。
+        provider 字段仅用于追溯，下游按 flow_type 取数，不按 source。
+        """
+        try:
+            import akshare as ak
+            fn = (ak.stock_fund_flow_industry if kind == "industry"
+                  else ak.stock_fund_flow_concept)
+            # 同花顺也会限流（实测偶发 'NoneType' object has no attribute 'text'
+            # —— 那是它返回了错误页而 akshare 直接 .text）→ 退避重试 2 次。
+            df = None
+            last_err = None
+            for attempt in range(3):
+                try:
+                    df = fn(symbol="即时")
+                    if df is not None and len(df):
+                        break
+                    df = None
+                except Exception as e:
+                    last_err = e
+                    df = None
+                if attempt < 2:
+                    import time as _t
+                    _t.sleep(2 + attempt * 2)
+            if df is None or len(df) == 0:
+                if last_err:
+                    self.logger.warning(
+                        f"_fetch_sector_fund_flow_ths({kind}) 同花顺返回异常: {last_err}")
+                return None
+            items = []
+            for i, row in enumerate(df.head(top_n).to_dict("records"), start=1):
+                def _num(v):
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        return None
+                net_yi = _num(row.get("净额"))          # 亿元
+                items.append({
+                    "rank_no": i,
+                    "sector_kind": kind,
+                    "symbol": None,                        # 板块无代码
+                    "name": row.get("行业"),
+                    "change_pct": _num(row.get("行业-涨跌幅")),
+                    "main_net_inflow": (net_yi * 1e8) if net_yi is not None else None,
+                    "main_net_pct": None,                  # 同花顺不提供占比
+                    "leading_stock": row.get("领涨股") or "-",
+                    "leading_change_pct": _num(row.get("领涨股-涨跌幅")),
+                    "provider": "ths",                     # 仅追溯用
+                })
+            self.logger.info(
+                f"_fetch_sector_fund_flow_ths({kind}) 获取 {len(items)} 条（同花顺兜底）")
+            return items or None
+        except Exception as e:
+            self.logger.warning(f"_fetch_sector_fund_flow_ths({kind}) 异常: {e}")
+            return None
+
     # ========== collect 接口 ==========
 
     async def collect(self, symbol: str, data_type: str, **kwargs) -> CollectResult:
@@ -541,11 +609,22 @@ class CommunityEnhancedCollector(BaseCollector):
                 functools.partial(self._fetch_sector_fund_flow, kind=kind, top_n=top_n)
             )
             if items is None:
-                return CollectResult(
-                    success=False, data=None, source="eastmoney_em",
-                    symbol=f"__sector_{kind}__", data_type=data_type,
-                    error=f"板块资金流({kind})请求失败", duration_seconds=(now_tz() - start).total_seconds()
+                # 东财失败 → 同花顺兜底（2026-11-13：东财对本机 IP 的封禁在恶化，
+                # 实测成功率从 100% 掉到 3%；同花顺口径不受影响）。
+                # 两个源都失败才算采集失败。
+                items = await asyncio.to_thread(
+                    functools.partial(self._fetch_sector_fund_flow_ths,
+                                      kind=kind, top_n=top_n)
                 )
+                if items is None:
+                    return CollectResult(
+                        success=False, data=None, source="eastmoney_em",
+                        symbol=f"__sector_{kind}__", data_type=data_type,
+                        error=f"板块资金流({kind})请求失败（东财与同花顺兜底均失败）",
+                        duration_seconds=(now_tz() - start).total_seconds()
+                    )
+                self.logger.info(
+                    f"sector_fund_flow({kind}) 东财不可用，已切同花顺兜底，{len(items)} 条")
             for it in items:
                 it["flow_type"] = "sector_fund_flow"
                 it["rank_date"] = rank_date
