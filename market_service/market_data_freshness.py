@@ -48,6 +48,8 @@ FAIL_RATE_THRESHOLD = 0.85          # 全局失败率 > 85% → 异常（保留�
 # 改为每个源单独算：样本 >= MIN_SAMPLES 才判（样本太少不判，避免小源噪声），
 # 且成功率 < 1-SUCCESS_RATE_THRESHOLD 才算异常。
 PER_SOURCE_MIN_SAMPLES = 20        # 每源最小样本数，低于此不判
+# 时段受限源只统计交易时段内的样本（全天采 vs 只在盘中采），样本天然更少
+PER_SOURCE_MIN_SAMPLES_TIME_WINDOWED = 5
 PER_SOURCE_SUCCESS_RATE_THRESHOLD = 0.80   # 成功率 < 80% → 异常
 # ⚠️ 分组失败率必须用**长窗口**：低频源每小时只采 1~4 次
 #    （实测 eastmoney_em 24h 共 96 条 ≈ 4 条/小时），
@@ -345,6 +347,36 @@ def selfcheck_exceptions(now=None):
         f"{ {k: sum(1 for v in srcs.values() if v['kind']==k) for k in ('paused_by_decision','time_windowed','fixed_watching')} }")
 
 
+def _event_in_trading_hours(event_ts, cal_days=None):
+    """判断**某条失败事件发生时刻**是否在 A 股交易时段内。
+
+    2026-11-13 新增。背景：eastmoney_em 被登记为 time_windowed（东财收盘后
+    对本机出口 IP 主动断连，资金流是日内数据，收盘后不采集是正确的）。
+    原豁免逻辑用 `in_trading_hours(now)` —— 判的是**探针跑的那一刻**，
+    而指标统计的是**最近 24 小时**的窗口：窗口里绝大多数失败发生在收盘后
+    （本该豁免），但只要探针恰好在盘中运行，`now` 在交易时段 → 整窗不豁免 →
+    把正常的盘后失败算成故障（实测 2026-11-12 成功率被算成 12.3%，实际
+    盘中也只有 38.9%，且盘后失败本属预期）。
+
+    正确口径：**时段受限的源，只把"交易时段内发生的失败"算作故障**；
+    盘后的失败是预期行为，不该进分母也不该进分子。
+    """
+    if event_ts is None:
+        return False
+    try:
+        dt = datetime.fromisoformat(str(event_ts)[:19])
+    except (TypeError, ValueError):
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone(timedelta(hours=8)))
+    if cal_days is None:
+        cal_days = _load_trade_calendar() or set()
+    if cal_days and dt.strftime("%Y-%m-%d") not in cal_days:
+        return False          # 非交易日 → 不算故障
+    mins = dt.hour * 60 + dt.minute
+    return (9 * 60 + 15) <= mins <= (15 * 60 + 5)
+
+
 def exception_applies(src, kind, event_ts=None, now=None, data_type=None):
     """判断某条异常是否落在"已知受限源"的豁免范围内
 
@@ -367,10 +399,19 @@ def exception_applies(src, kind, event_ts=None, now=None, data_type=None):
     if k == "paused_by_decision":
         return True, f"[已知暂停] {ex['reason']}｜复核方式: {ex['review']}"
     if k == "time_windowed":
-        # 交易时段内的失败是真故障，不豁免
-        if in_trading_hours(now):
-            return False, ""
-        return True, (f"[已知时段受限] {ex['reason']}｜"
+        # 时段受限的源：**只有交易时段内发生的失败**才算故障。
+        # 判据是**事件发生时刻**，不是探针运行时刻 —— 否则 24h 窗口里的
+        # 盘后失败（预期行为）会把整窗判成故障（2026-11-13 实测误报）。
+        # event_ts 为 None（按源聚合、拿不到单条事件时刻）时保守处理：
+        # 仍按 now 判，避免因缺时刻而漏报真故障。
+        if event_ts is None:
+            if in_trading_hours(now):
+                return False, ""
+            return True, (f"[已知时段受限] {ex['reason']}｜"
+                          f"复核方式: {ex['review']}")
+        if _event_in_trading_hours(event_ts):
+            return False, ""      # 盘中失败 = 真故障，不豁免
+        return True, (f"[已知时段受限·失败发生在非交易时段] {ex['reason']}｜"
                       f"复核方式: {ex['review']}")
     if k == "fixed_watching":
         since = ex.get("since")
@@ -762,8 +803,31 @@ def main():
         for src, f_cnt, t_cnt in cur.fetchall():
             f_cnt = f_cnt or 0
             t_cnt = t_cnt or 0
-            if t_cnt < PER_SOURCE_MIN_SAMPLES:
-                log(f"  [样本不足] {src}: {f_cnt}/{t_cnt}（样本<{PER_SOURCE_MIN_SAMPLES}，不判）")
+            # 时段受限的源（time_windowed）：**只统计交易时段内的样本**。
+            # 盘后失败是预期行为（东财收盘后断连），混进分母会把正常状态
+            # 算成故障（2026-11-12 实测：混入后成功率 12.3%，实际盘中
+            # 只有 38.9%，其余全是盘后预期失败）。
+            ex0 = KNOWN_SOURCE_EXCEPTIONS.get(src)
+            if ex0 and ex0["kind"] == "time_windowed":
+                cur.execute("""
+                    SELECT SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END), COUNT(*)
+                    FROM collection_log
+                    WHERE started_at >= ? AND source = ?
+                      AND date(started_at) IN (%s)
+                      AND time(started_at) >= '09:15:00' AND time(started_at) <= '15:05:00'
+                """ % ",".join("'%s'" % d for d in sorted(_load_trade_calendar() or [])),
+                    (ws, src))
+                tf, tt = cur.fetchone()
+                tf, tt = tf or 0, tt or 0
+                if tt > 0:
+                    log(f"  · {src}: 时段受限源，只看交易时段内样本：{tt} 条（原窗口 {t_cnt} 条）")
+                    f_cnt, t_cnt = tf, tt
+            # 时段受限源只统计盘中样本 → 样本天然更少，门槛单独放宽
+            min_samples = PER_SOURCE_MIN_SAMPLES
+            if ex0 and ex0["kind"] == "time_windowed":
+                min_samples = PER_SOURCE_MIN_SAMPLES_TIME_WINDOWED
+            if t_cnt < min_samples:
+                log(f"  [样本不足] {src}: {f_cnt}/{t_cnt}（样本<{min_samples}，不判）")
                 continue
             succ_rate = 1 - (f_cnt / t_cnt)
             # 已知受限源：按类别判断是否豁免（时段受限在交易时段内不豁免）
@@ -808,6 +872,38 @@ def main():
                     WHERE started_at >= ? AND status='failed' AND source=? AND data_type=?
                 """, (wr, src, dt))
                 tot_f = cur.fetchone()[0] or 0
+                # 时段受限的源：重复错误也要**只看交易时段内**。
+                # 盘后每次都失败 → 同一错误重复 N 次是**预期行为**，
+                # 不是"接口稳定返回无效内容"（那才是真故障的特征）。
+                ex_r = KNOWN_SOURCE_EXCEPTIONS.get((src, dt)) or KNOWN_SOURCE_EXCEPTIONS.get(src)
+                if ex_r and ex_r["kind"] == "time_windowed":
+                    cur.execute("""
+                        SELECT COUNT(*) FROM collection_log
+                        WHERE started_at >= ? AND status='failed' AND source=? AND data_type=?
+                          AND date(started_at) IN (%s)
+                          AND time(started_at) >= '09:15:00' AND time(started_at) <= '15:05:00'
+                    """ % ",".join("'%s'" % d for d in sorted(_load_trade_calendar() or [])),
+                        (wr, src, dt))
+                    tot_f = cur.fetchone()[0] or 0
+                    if tot_f == 0:
+                        log(f"  [已知时段受限] {src}/{dt}: 重复失败全部发生在非交易时段 → 预期行为，不告警")
+                        continue
+                    cur.execute("""
+                        SELECT COUNT(*) FROM collection_log
+                        WHERE started_at >= ? AND status='failed' AND source=? AND data_type=?
+                          AND error_message = ?
+                          AND date(started_at) IN (%s)
+                          AND time(started_at) >= '09:15:00' AND time(started_at) <= '15:05:00'
+                    """ % ",".join("'%s'" % d for d in sorted(_load_trade_calendar() or [])),
+                        (wr, src, dt, err_msg))
+                    n = cur.fetchone()[0] or 0
+                    log(f"  · {src}/{dt}: 时段受限源，只看交易时段内重复：{n}/{tot_f} 次")
+                    # 受限后的计数可能远小于原始 HAVING 门槛（原始是全窗口计数）
+                    # → 必须**重新过最小次数门槛**，否则 1 次失败会被判成"100% 重复"
+                    if n < REPEAT_ERROR_MIN_COUNT:
+                        log(f"  [样本不足] {src}/{dt}: 交易时段内重复 {n} 次"
+                            f"（<{REPEAT_ERROR_MIN_COUNT}，不判）")
+                        continue
                 ratio = (n / tot_f) if tot_f else 0
                 if ratio < REPEAT_ERROR_MIN_RATIO:
                     continue
