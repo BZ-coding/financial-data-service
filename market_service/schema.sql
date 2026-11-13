@@ -530,6 +530,11 @@ CREATE TABLE IF NOT EXISTS stock_fundamentals (
 CREATE TABLE IF NOT EXISTS mmx_search_data (id INTEGER PRIMARY KEY AUTOINCREMENT, query TEXT NOT NULL, title TEXT, link TEXT, snippet TEXT, date TEXT, collected_at TEXT NOT NULL, ingested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS idx_mmx_collected ON mmx_search_data(collected_at DESC);
 CREATE INDEX IF NOT EXISTS idx_mmx_query ON mmx_search_data(query);
+-- 2026-11-13（docs/decisions/0005 体检）：搜索结果按 link 业务唯一（同一搜索结果只存一行）。
+-- ⚠️ 唯一索引**不能**写在这里：老库有 73,613 行重复，这里建索引会先于去重执行
+--    → init_tables 直接 IntegrityError 整段失败（与 2026-11-12 公告 announcement_id
+--    的顺序冲突同一类坑）。老库去重 + 建索引统一由 database._migrate_mmx_uniqueness()
+--    负责（先去重再建索引，幂等）。新库由下表的建表语句之后的迁移步骤兜底。
 
 -- ---------- bid_ask_data ----------
 CREATE TABLE IF NOT EXISTS bid_ask_data (

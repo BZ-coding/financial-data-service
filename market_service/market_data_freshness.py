@@ -164,10 +164,19 @@ MARKET_TABLES = {"price_data", "minute_data"}
 #
 # ⚠️ 身份键必须与表上的业务唯一约束**完全一致**（含 source 列）——
 #   少一列会把不同来源的同一实体误判成重复（假警），多一列会漏掉真重复。
+# 2026-11-13 举一反三扩表（docs/decisions/0005 体检结论）：
+#   mmx_search_data 无唯一约束，采集器全量重插 → 73,613 行重复（18 倍膨胀）
+#   nav_data 约束含 source，但业务上同日同基金只应一个净值 → 用业务键 (symbol, nav_date)
+#   stock_fundamentals 无约束（当前 0 重复，靠采集端幂等）
 IDENTITY_UNIQUENESS_TABLES = {
     "announcement_data": ("source", "symbol", "announcement_id"),
     "news_data": ("link",),
     "price_data": ("source", "symbol", "trade_time"),
+    "mmx_search_data": ("link",),
+    "stock_fundamentals": ("symbol", "date"),
+    # ⚠️ 业务键故意不含 source：约束键含 source 会放过"跨源同日双份"——
+    #    业务上同一基金同一天只应有一个净值，双源入库就是重复。
+    "nav_data": ("symbol", "nav_date"),
 }
 # announcement_data 里 announcement_id 为空的行：身份键缺失，无法判定唯一性，
 #   单独计数告警（这类行一旦变多，就是身份抽取逻辑退化的信号）。

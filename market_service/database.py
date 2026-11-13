@@ -342,6 +342,12 @@ class Database:
         except Exception as e:
             logger.error(f"公告身份迁移失败: {e}")
 
+        # mmx 搜索结果唯一性迁移（幂等，2026-11-13，docs/decisions/0005）
+        try:
+            self._migrate_mmx_uniqueness()
+        except Exception as e:
+            logger.error(f"mmx 唯一性迁移失败: {e}")
+
     def _migrate_announcement_identity(self) -> None:
         """公告身份迁移 (2026-11-12, 幂等，每次 init_tables 跑一遍)。
 
@@ -398,6 +404,33 @@ class Database:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_ann_identity"
             " ON announcement_data(source, symbol, announcement_id)"
             " WHERE announcement_id IS NOT NULL")
+        self.conn.commit()
+
+    def _migrate_mmx_uniqueness(self) -> None:
+        """mmx_search_data 唯一性迁移 (2026-11-13, 幂等)。
+
+        体检发现（docs/decisions/0005）：表无唯一约束，insert_mmx_search 的
+        INSERT OR IGNORE 在无约束时是 no-op → 采集器每次全量重插同样结果，
+        实测 77,887 行 / 4,274 distinct link（18 倍膨胀，近 3 天新增 3,393 行
+        仅 335 个不同 link）。
+
+        1) 老库先去重（同 link 保留最早一行），再建部分唯一索引
+        2) 幂等：索引已存在且无重复时是 no-op
+        """
+        try:
+            self.conn.execute("""
+                DELETE FROM mmx_search_data WHERE id NOT IN (
+                    SELECT MIN(id) FROM mmx_search_data
+                    WHERE link IS NOT NULL AND link != ''
+                    GROUP BY link
+                ) AND link IS NOT NULL AND link != ''
+            """)
+            self.conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"mmx 去重失败: {e}")
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_mmx_link"
+            " ON mmx_search_data(link) WHERE link IS NOT NULL AND link != ''")
         self.conn.commit()
 
     # ==================== NAV DATA ====================
@@ -747,12 +780,23 @@ class Database:
         return None
 
     def get_nav_history(self, symbol: str, days: int = 30) -> List[Dict[str, Any]]:
-        """获取历史净值"""
+        """获取历史净值（同日多行按 id 取最新一行）。
+
+        2026-11-13（docs/decisions/0005 体检）：nav_data 约束是
+        UNIQUE(source, symbol, nav_date)——含 source，跨源同日会各存一行
+        （实测 11 组 akshare+eastmoney_web 同日双行）。业务上同一基金同一天
+        只应有一个净值；出口不去重的话，/api/v1/history 与指标计算
+        （bars_from_nav）会拿到同日多行，日期序列错位。取同日 id 最大
+        （最新采集）的一行。
+        """
         start_date = (datetime.now(TZ) - timedelta(days=days)).date()
         cur = self.conn.execute("""
             SELECT nav_date, nav, acc_nav, change_pct
             FROM nav_data
             WHERE symbol = ? AND nav_date >= ?
+              AND id = (SELECT MAX(id) FROM nav_data n2
+                        WHERE n2.symbol = nav_data.symbol
+                          AND n2.nav_date = nav_data.nav_date)
             ORDER BY nav_date ASC
         """, (symbol, start_date))
         return [dict(row) for row in cur.fetchall()]
