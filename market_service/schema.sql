@@ -23,6 +23,10 @@ CREATE TABLE IF NOT EXISTS nav_data (
 );
 
 CREATE INDEX IF NOT EXISTS idx_nav_lookup ON nav_data(symbol, nav_date DESC);
+-- 2026-11-13（docs/decisions/0005）：业务唯一 (symbol, nav_date)——同一基金同一天只应一个净值。
+-- ⚠️ 唯一索引**不能**写在这里：老库有跨源同日重复，这里建索引会先于去重执行 →
+--    init_tables 直接 IntegrityError 整段失败（与 announcement_id / mmx link 同一类顺序坑）。
+--    老库合并 + 建索引由 database._migrate_nav_uniqueness() 负责（幂等）。
 CREATE INDEX IF NOT EXISTS idx_nav_ingested ON nav_data(ingested_at DESC);
 
 -- ============================================

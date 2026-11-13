@@ -348,6 +348,12 @@ class Database:
         except Exception as e:
             logger.error(f"mmx 唯一性迁移失败: {e}")
 
+        # 净值业务唯一性迁移（幂等，2026-11-13，docs/decisions/0005）
+        try:
+            self._migrate_nav_uniqueness()
+        except Exception as e:
+            logger.error(f"净值唯一性迁移失败: {e}")
+
     def _migrate_announcement_identity(self) -> None:
         """公告身份迁移 (2026-11-12, 幂等，每次 init_tables 跑一遍)。
 
@@ -431,6 +437,34 @@ class Database:
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_mmx_link"
             " ON mmx_search_data(link) WHERE link IS NOT NULL AND link != ''")
+        self.conn.commit()
+
+    def _migrate_nav_uniqueness(self) -> None:
+        """净值业务唯一性迁移 (2026-11-13, 幂等，docs/decisions/0005)。
+
+        表约束是 UNIQUE(source, symbol, nav_date) —— **含 source**，于是
+        「同一基金同一天、不同来源」各存一行（实测 008114 有 11 组
+        akshare + eastmoney_web 同日双行，净值相同）。
+
+        业务上同一基金同一天只应有一个净值：
+          1) 老库合并：同 (symbol, nav_date) 保留 ingested_at 最新的一行
+          2) 建业务唯一索引 (symbol, nav_date)
+          3) insert_nav 用 INSERT OR REPLACE → 命中该唯一索引时**替换**旧行
+             （不再是并存两行），采集端换源也不会造成同日双份
+        """
+        try:
+            self.conn.execute("""
+                DELETE FROM nav_data WHERE id NOT IN (
+                    SELECT MAX(id) FROM nav_data
+                    GROUP BY symbol, nav_date
+                )
+            """)
+            self.conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"净值去重失败: {e}")
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_nav_symbol_date "
+            "ON nav_data(symbol, nav_date)")
         self.conn.commit()
 
     # ==================== NAV DATA ====================
